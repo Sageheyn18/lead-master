@@ -1,23 +1,25 @@
 """
-Lead Master – fetch_signals.py (OpenAI v1+)
- • Gets yesterday’s news from GDELT, falls back to Google News RSS.
- • Summarises headlines with GPT-4o using the new OpenAI client.
- • Writes signals + sector tags into SQLite.
+Lead Master – fetch_signals.py (OpenAI v1, resilient JSON)
+
+• Grabs yesterday’s news from GDELT; if slow, falls back to Google News RSS.
+• Summarises all headlines for one company with GPT-4o-mini (new OpenAI client).
+• Handles bad GPT JSON gracefully.
+• Writes signals + sector tags into SQLite.
 """
 
 import os, json, datetime, logging, textwrap, sqlite3
 import requests, feedparser, pandas as pd
-from openai import OpenAI                           # ← new import
+from openai import OpenAI                     # ← v1 client
 
 from utils import get_conn, ensure_tables, cache_summary
 
-# ─────────────────── configuration ───────────────────
+# ────────────────────── config ──────────────────────
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES_PER_RUN", 10))
 
-# ─────────────────── helpers ─────────────────────────
+# ────────────────── helpers ─────────────────────────
 def gdelt_headlines(company: str) -> list[dict]:
-    """Try GDELT; if it times out, fall back to Google News RSS."""
+    """Try GDELT first; fall back to Google News RSS if GDELT times out."""
     yday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y%m%d")
     gdelt_url = (
         "https://api.gdeltproject.org/api/v2/doc/docsearch"
@@ -32,8 +34,7 @@ def gdelt_headlines(company: str) -> list[dict]:
     except Exception as e:
         logging.warning(f"GDELT error {e} – switching to Google News RSS")
         feed = feedparser.parse(
-            f"https://news.google.com/rss/search?q={company}"
-            "&hl=en-US&gl=US&ceid=US:en"
+            f"https://news.google.com/rss/search?q={company}&hl=en-US&gl=US&ceid=US:en"
         )
         return [
             {"text": ent.title, "url": ent.link, "date": yday}
@@ -41,9 +42,10 @@ def gdelt_headlines(company: str) -> list[dict]:
         ]
 
 def summarise(company: str, headlines: list[dict]) -> dict | None:
-    """One GPT-4o call returns JSON summary & sector guess."""
+    """Call GPT-4o once; return dict even if GPT gives plain text."""
     if not headlines:
         return None
+
     bullets = "\n".join(f"- {h['text']}" for h in headlines)
     prompt = textwrap.dedent(
         f"""
@@ -52,10 +54,12 @@ def summarise(company: str, headlines: list[dict]) -> dict | None:
         Headlines (last 24 h):
         {bullets}
 
-        Return JSON with keys:
-        summary     – one concise sentence
-        sector      – guessed sector (e.g. food-processing, cold-storage)
-        confidence  – 0-1 float
+        Return ONLY JSON like:
+        {{
+          "summary": "...",
+          "sector": "...",
+          "confidence": 0.8
+        }}
         """
     ).strip()
 
@@ -65,21 +69,34 @@ def summarise(company: str, headlines: list[dict]) -> dict | None:
         temperature=0.2,
         max_tokens=200,
     )
-    return json.loads(rsp.choices[0].message.content)
 
-# ─────────────────── main routine ────────────────────
-def run():
+    content = rsp.choices[0].message.content.strip()
+
+    try:                                     # robust parse
+        js = json.loads(content)
+    except json.JSONDecodeError:
+        logging.warning("GPT returned non-JSON; using raw text.")
+        js = {"summary": content, "sector": "unknown", "confidence": 0.0}
+
+    return js
+
+# ────────────────── main routine ───────────────────
+def run() -> None:
     conn = get_conn()
     ensure_tables(conn)
 
-    companies = pd.read_sql(
-        "SELECT name FROM clients LIMIT ?", conn, params=(MAX_COMPANIES,)
-    )["name"].tolist() or ["Acme Foods"]  # seed if DB empty
+    companies = (
+        pd.read_sql("SELECT name FROM clients LIMIT ?", conn, params=(MAX_COMPANIES,))
+        ["name"]
+        .tolist()
+        or ["Acme Foods"]  # seed if DB empty
+    )
 
     for co in companies:
         heads = [h for h in gdelt_headlines(co) if not cache_summary(h["url"])]
         if not heads:
             continue
+
         info = summarise(co, heads)
         if not info:
             continue
@@ -90,7 +107,7 @@ def run():
             conn.execute(
                 """
                 INSERT INTO signals
-                (company, date, headline, url, confidence, sector_guess)
+                (company,date,headline,url,confidence,sector_guess)
                 VALUES (?,?,?,?,?,?)
                 """,
                 (
@@ -104,12 +121,20 @@ def run():
             )
 
         # update / insert client row
-        existing = conn.execute(
-            "SELECT sector_tags FROM clients WHERE name=?", (co,)
-        ).fetchone()
-        tags = json.loads(existing[0]) if existing else []
+        tags = (
+            json.loads(
+                conn.execute(
+                    "SELECT sector_tags FROM clients WHERE name=?", (co,)
+                ).fetchone()[0]
+            )
+            if conn.execute(
+                "SELECT 1 FROM clients WHERE name=?", (co,)
+            ).fetchone()
+            else []
+        )
         if info["sector"] and info["sector"] not in tags:
             tags.append(info["sector"])
+
         conn.execute(
             """
             INSERT OR REPLACE INTO clients
