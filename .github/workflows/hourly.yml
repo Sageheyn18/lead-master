@@ -1,0 +1,19 @@
+
+name: hourly-refresh
+on:
+  schedule:
+    - cron: '20 * * * *'
+  workflow_dispatch:
+jobs:
+  small:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MAX_COMPANIES_PER_RUN: 10
+        run: python fetch_signals.py
