@@ -1,10 +1,10 @@
 """
-fetch_signals.py – Lead Master  v4.4-a
-• 15-second GDELT timeout; after first miss we stick to Google News
-• Progress bar covers all phases (0 → 100 %)
-• GPT calls wrapped with 20 s back-off on RateLimitError
-• Keyword pre-filter, fuzzy dedup (≥ 80 %)
-• GPT daily-budget guard, HQ-city geocode fallback → lat/lon
+fetch_signals.py – Lead Master  v4.5
+• GDELT 15 s timeout; sticky Google fallback
+• GPT-3.5-turbo for company-name extraction (high RPM, cheap)
+• GPT-4o-mini for summary with automatic 21-s throttle (org limit 3 RPM)
+• Progress bar 0–100 %, fuzzy dedup, keyword filter
+• HQ-city geocode fallback, daily budget guard
 """
 
 import os, json, time, datetime, logging, textwrap, requests, feedparser
@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 
 import streamlit as st
 from geopy.geocoders import Nominatim
-from openai import OpenAI, RateLimitError        # ← fixed import
+from openai import OpenAI, RateLimitError
 
 from utils import get_conn, ensure_tables
 
@@ -21,10 +21,13 @@ from utils import get_conn, ensure_tables
 client   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 geocoder = Nominatim(user_agent="lead-master")
 
-MAX_PROSPECTS   = 50           # per scheduled scan
-MAX_HEADLINES   = 50           # per manual search
+MAX_PROSPECTS   = 50
+MAX_HEADLINES   = 50
 DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))  # ≈ $3/day
-BUDGET_USED     = 0            # tracked each run
+BUDGET_USED     = 0
+
+# simple throttle for GPT-4o summary
+_4O_LAST_CALL = 0
 
 SEED_KWS = [
     "land purchase", "buys acreage", "acquire site", "groundbreaking",
@@ -47,43 +50,49 @@ def dedup(titles: list[str]) -> list[str]:
             kept.append(t)
     return kept
 
-def budget_ok(cost_cents: float) -> bool:
+def budget_ok(cost: float) -> bool:
     global BUDGET_USED
-    if BUDGET_USED + cost_cents > DAILY_BUDGET:
+    if BUDGET_USED + cost > DAILY_BUDGET:
         logging.warning("GPT budget exceeded; skipping call.")
         return False
-    BUDGET_USED += cost_cents
+    BUDGET_USED += cost
     return True
 
-# safe GPT wrapper ------------------------------------------------------------
+# safe GPT wrapper (handles rate limit)
 def safe_chat(**params):
-    """Call OpenAI with automatic 20 s back-off (max 3 tries)."""
     for attempt in range(3):
         try:
             return client.chat.completions.create(**params)
-        except RateLimitError as e:
-            wait = 20
-            logging.warning("OpenAI rate-limit hit – waiting %s s (%s/3)", wait, attempt+1)
-            time.sleep(wait)
-    logging.error("OpenAI still rate-limited after retries; returning None.")
+        except RateLimitError:
+            logging.warning("OpenAI rate-limit; wait 21 s (%s/3)", attempt+1)
+            time.sleep(21)
+    logging.error("OpenAI limit after retries; returning None")
     return None
-# -----------------------------------------------------------------------------
 
+# ───────── GPT utilities ─────────
 def gpt_company(headline: str) -> str:
-    if not budget_ok(0.2):
+    """Uses GPT-3.5 (60 RPM) so it never hits 4o limit."""
+    if not budget_ok(0.05):          # cheap
         return "Unknown"
     rsp = safe_chat(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": f"Primary company in headline: {headline}"}],
+        model="gpt-3.5-turbo",
+        messages=[{"role":"user",
+                   "content":f"Give ONLY the primary company name in: {headline}"}],
         temperature=0, max_tokens=16,
     )
     if rsp is None: return "Unknown"
     return rsp.choices[0].message.content.strip().strip('"')
 
 def gpt_summary(company: str, heads: list[str]) -> dict:
+    global _4O_LAST_CALL
     if not heads:
-        return {"summary":"No construction-related headlines found.",
+        return {"summary":"No construction headlines.",
                 "sector":"unknown","confidence":0,"land_flag":0}
+    # throttle 4-o: ensure 21 s since last call
+    now = time.time()
+    wait = 21 - (now - _4O_LAST_CALL)
+    if wait > 0:
+        time.sleep(wait)
     if not budget_ok(0.5):
         return {"summary":heads[0][:120]+"…","sector":"unknown",
                 "confidence":0,"land_flag":0}
@@ -99,6 +108,7 @@ def gpt_summary(company: str, heads: list[str]) -> dict:
         messages=[{"role":"user","content":prompt}],
         temperature=0.2,max_tokens=220,
     )
+    _4O_LAST_CALL = time.time()
     if rsp is None:
         return {"summary":heads[0][:120]+"…","sector":"unknown",
                 "confidence":0,"land_flag":0}
@@ -126,27 +136,24 @@ def google_news(query: str, max_rec: int = 20):
         for ent in feed.entries[:max_rec]
     ]
 
-GDELT_WORKING = True   # sticky flag (per scan run)
+GDELT_WORKING = True   # sticky flag
 
 def gdelt_or_google(query: str, max_rec: int = 20):
-    """Try GDELT (15 s). After first timeout, stick to Google News."""
     global GDELT_WORKING
     if not GDELT_WORKING:
         return google_news(query, max_rec)
-
     url = (
         "https://api.gdeltproject.org/api/v2/doc/docsearch"
         f"?query={query}&maxrecords={max_rec}&format=json"
     )
     try:
-        js = requests.get(url, timeout=15).json()
-        return js.get("articles", [])
+        return requests.get(url, timeout=15).json().get("articles", [])
     except Exception as e:
-        logging.warning(f"GDELT timeout: {e} → switching to Google News")
+        logging.warning("GDELT timeout: %s → Google News", e)
         GDELT_WORKING = False
         return google_news(query, max_rec)
 
-# ───────── DB writer ─────────
+# ───────── DB helper ─────────
 def write_signals(rows, conn):
     for r in rows:
         conn.execute(
@@ -162,7 +169,7 @@ def write_signals(rows, conn):
         )
     conn.commit()
 
-# ───────── national scan (cron & manual button) ─────────
+# ───────── national scan (cron & manual) ─────────
 def national_scan():
     conn = get_conn(); ensure_tables(conn)
     prospects = []
@@ -184,27 +191,26 @@ def national_scan():
                     break
         if len(prospects) >= MAX_PROSPECTS:
             break
-        progress.progress(i / 20)          # 10 keywords maps to 0–0.5
+        progress.progress(i / 20)          # 0–0.5
 
     prospects = [p for p in prospects
                  if p["headline"] in dedup([q["headline"] for q in prospects])]
 
-    # Phase 2 – GPT company extraction (50–80 %)
-    by_company = defaultdict(list)
+    # Phase 2 – company extract (50–80 %)
+    by_co = defaultdict(list)
     for j, p in enumerate(prospects, 1):
         p["company"] = gpt_company(p["headline"])
-        by_company[p["company"]].append(p)
+        by_co[p["company"]].append(p)
         progress.progress(0.5 + 0.3 * j / len(prospects))
 
     # Phase 3 – summary + geocode (80–100 %)
     rows = []
-    companies = list(by_company)
-    for k, co in enumerate(companies, 1):
-        items = by_company[co]
-        heads = [i["headline"] for i in items]
-        info  = gpt_summary(co, heads)
+    co_list = list(by_co)
+    for k, co in enumerate(co_list, 1):
+        items = by_co[co]
+        info  = gpt_summary(co, [i["headline"] for i in items])
         for itm in items:
-            lat, lon = geocode(itm["headline"])
+            lat, lon = geocode(itm["headline"] or co)
             itm.update(
                 land_flag=info["land_flag"], sector=info["sector"],
                 lat=lat, lon=lon
@@ -216,14 +222,13 @@ def national_scan():
             "(name, summary, sector_tags, status) VALUES (?,?,?, 'New')",
             (co, info["summary"], json.dumps([info["sector"]]))
         )
-        progress.progress(0.8 + 0.2 * k / len(companies))
+        progress.progress(0.8 + 0.2 * k / len(co_list))
 
     write_signals(rows, conn)
-    progress.progress(1.0)
-    progress.empty()
+    progress.progress(1.0); progress.empty()
     logging.info("Scan wrote %s signals", len(rows))
 
-# ───────── manual search helper for UI ─────────
+# ───────── UI helper (manual search) ─────────
 def headlines_for_company(company: str) -> list[dict]:
     today  = datetime.date.today()
     start  = today - datetime.timedelta(days=150)
@@ -236,20 +241,3 @@ def headlines_for_company(company: str) -> list[dict]:
             res.append(
                 {"title": title, "url": a["url"],
                  "date": a["seendate"][:8], "src": "search"}
-            )
-        if len(res) >= MAX_HEADLINES:
-            break
-    return res
-
-def manual_search(company: str):
-    rows  = headlines_for_company(company)
-    heads = dedup([r["title"] for r in rows])[:MAX_HEADLINES]
-    info  = gpt_summary(company, heads)
-    lat, lon = geocode(info["summary"])
-    return info, heads, lat, lon
-
-# ───────── CLI entry (local test) ─────────
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s  %(message)s")
-    national_scan()
