@@ -1,139 +1,131 @@
 """
-fetch_signals.py – Lead Master (map edition)
-• Pulls yesterday’s news with GDELT; falls back to Google News RSS.
-• Summarises headlines with GPT-4o (OpenAI v1 client).
-• Handles non-JSON GPT replies gracefully.
-• Writes signals + sector tags into SQLite.
+fetch_signals.py – Lead Master (caps + GPT company extract + read_flag)
 """
 
-import os, json, datetime, logging, textwrap
-import requests, feedparser, pandas as pd
+import os, json, datetime, logging, textwrap, re, requests, feedparser
+import pandas as pd
 from openai import OpenAI
+from geopy.geocoders import Nominatim
 from utils import get_conn, ensure_tables, cache_summary
 
-# ───────── configuration ─────────
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MAX_PROSPECTS = 50          # used by daily scan
+client   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+geoloc   = Nominatim(user_agent="lead-master")
+MAX_HEADLINES   = 50      # per manual search
+MAX_PROSPECTS   = 50      # per scheduled scan
+SEED_KWS = ["plant expansion","groundbreaking","distribution center","warehouse",
+            "cold storage","factory","manufacturing facility","acquire site",
+            "buys land","facility renovation"]
 
-# ───────── headline fetchers ─────────
-def gdelt_headlines(company: str) -> list[dict]:
-    """Return yesterday’s headlines for the company."""
-    yday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y%m%d")
-    url = (
-        "https://api.gdeltproject.org/api/v2/doc/docsearch"
-        f"?query=\"{company}\" AND {yday}&maxrecords=20&format=json"
-    )
+
+# ---------- helper: geocode city/state ----------
+def geocode_place(text: str) -> tuple[float|None, float|None]:
     try:
-        js = requests.get(url, timeout=60).json()
-        return [
-            {"text": art["title"], "url": art["url"], "date": art["seendate"][:8], "src": "GDELT"}
-            for art in js.get("articles", [])
-        ]
-    except Exception as e:
-        logging.warning(f"GDELT error {e} – switching to Google News RSS")
+        loc = geoloc.geocode(text, timeout=10)
+        return (loc.latitude, loc.longitude) if loc else (None, None)
+    except Exception:
+        return (None, None)
+
+
+# ---------- headline collectors ----------
+def gdelt_search(query: str, max_rec: int = 20):
+    url = f"https://api.gdeltproject.org/api/v2/doc/docsearch?query={query}&maxrecords={max_rec}&format=json"
+    try:
+        return requests.get(url, timeout=60).json().get("articles", [])
+    except Exception:
+        return []
+
+
+def headlines_for_company(co: str) -> list[dict]:
+    yday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+    arts = gdelt_search(f'\"{co}\" AND {yday}', 40)
+    if not arts:
         feed = feedparser.parse(
-            f"https://news.google.com/rss/search?q={company}&hl=en-US&gl=US&ceid=US:en"
+            f"https://news.google.com/rss/search?q={co}&hl=en-US&gl=US&ceid=US:en"
         )
-        return [
-            {"text": ent.title, "url": ent.link, "date": yday, "src": "Google"}
-            for ent in feed.entries[:20]
-        ]
+        return [{"title": ent.title, "url": ent.link, "date": yday, "src": "Google"} for ent in feed.entries[:MAX_HEADLINES]]
+    return [
+        {"title": a["title"], "url": a["url"], "date": a["seendate"][:8], "src": "GDELT"}
+        for a in arts[:MAX_HEADLINES]
+    ]
 
-# ───────── GPT summariser ─────────
-def summarise(company: str, headlines: list[dict]) -> dict | None:
-    """Return dict even if GPT responds with plain text."""
-    if not headlines:
-        return None
 
-    bullets = "\n".join(f"- {h['text']}" for h in headlines)
-    prompt = textwrap.dedent(
-        f"""
-        You are a construction-lead analyst.
-        Company: {company}
-        Headlines (last 24 h):
-        {bullets}
-
-        Respond ONLY with JSON:
-        {{
-          "summary": "one concise sentence …",
-          "sector": "…",
-          "confidence": 0.8,
-          "land_flag": 0
-        }}
-        """
-    ).strip()
-
+# ---------- GPT helpers ----------
+def gpt_company_name(headline: str) -> str:
+    prompt = f"From this headline give ONLY the primary company name: {headline}"
     rsp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=220,
+        temperature=0, max_tokens=20,
     )
-    content = rsp.choices[0].message.content.strip()
+    return rsp.choices[0].message.content.strip().replace('"', '')
 
+
+def summarise(company: str, heads: list[dict]) -> dict | None:
+    if not heads: return None
+    bullets = "\n".join(f"- {h['title']}" for h in heads)
+    prompt = textwrap.dedent(f"""
+        Summarise in one sentence. Guess sector. land_flag=1 if headline implies land purchase/new site.
+        Return JSON {{summary, sector, confidence, land_flag}}
+        Headlines:
+        {bullets}
+    """)
+    rsp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2, max_tokens=220,
+    )
     try:
-        js = json.loads(content)
-    except json.JSONDecodeError:
-        logging.warning("GPT returned non-JSON; wrapping raw text.")
-        js = {"summary": content, "sector": "unknown", "confidence": 0.0, "land_flag": 0}
+        return json.loads(rsp.choices[0].message.content.strip())
+    except Exception:
+        txt = rsp.choices[0].message.content.strip()
+        return {"summary": txt, "sector": "unknown", "confidence": 0, "land_flag": 0}
 
-    return js
 
-# ───────── main daily run (used by workflows) ─────────
-def run():
-    conn = get_conn()
+# ---------- national scan (cron & manual) ----------
+def national_scan():
+    conn = get_conn(); ensure_tables(conn)
+    # build keyword list (SEED_KWS + GPT expansion weekly)
+    kws = SEED_KWS
+    # grab top prospects
+    prospects = []
+    for kw in kws[:10]:
+        for art in gdelt_search(kw, 10):
+            headline = art["title"]
+            company  = gpt_company_name(headline)
+            prospects.append({
+                "company": company,
+                "headline": headline,
+                "url": art["url"],
+                "date": art["seendate"][:8],
+                "src": "scan"
+            })
+            if len(prospects) >= MAX_PROSPECTS:
+                break
+        if len(prospects) >= MAX_PROSPECTS:
+            break
+    write_signals(prospects, conn)
+
+
+# ---------- write signals & upsert client ----------
+def write_signals(arts: list[dict], conn):
     ensure_tables(conn)
-
-    companies = (
-        pd.read_sql("SELECT name FROM clients", conn)["name"].tolist()
-        or ["Acme Foods"]
-    )
-
-    for co in companies:
-        heads = [h for h in gdelt_headlines(co) if not cache_summary(h["url"])]
-        info = summarise(co, heads) if heads else None
-        if not info:
-            continue
-
-        # save signals
-        for h in heads:
-            cache_summary(h["url"], info["summary"])
-            conn.execute(
-                """
-                INSERT INTO signals
-                (company, date, headline, url, source_label, land_flag, sector_guess)
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    co,
-                    h["date"],
-                    info["summary"],
-                    h["url"],
-                    h["src"],
-                    info["land_flag"],
-                    info["sector"],
-                ),
-            )
-
-        # upsert client basic data
-        existing = conn.execute(
-            "SELECT sector_tags FROM clients WHERE name=?", (co,)
-        ).fetchone()
-        tags = json.loads(existing[0]) if existing else []
-        if info["sector"] and info["sector"] not in tags:
-            tags.append(info["sector"])
-
+    for art in arts:
+        co = art["company"]
+        lat, lon = geocode_place(art["headline"])
         conn.execute(
             """
-            INSERT OR REPLACE INTO clients
-            (name, summary, sector_tags, status)
-            VALUES (?,?,?, 'New')
+            INSERT INTO signals
+            (company,date,headline,url,source_label,land_flag,sector_guess,lat,lon)
+            VALUES (?,?,?,?,?,?,?, ?, ?)
             """,
-            (co, info["summary"], json.dumps(tags)),
+            (
+                co, art["date"], art["headline"], art["url"], art["src"],
+                1 if "land" in art["headline"].lower() else 0, "",
+                lat, lon
+            )
         )
-        conn.commit()
-        logging.info(f"{co}: saved")
+    conn.commit()
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
-    run()
+    national_scan()
