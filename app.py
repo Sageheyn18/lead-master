@@ -81,9 +81,17 @@ else:
                     st.rerun()
         idx = (idx + 1) % 3
 
-    if "view_company" in st.session_state:
-        target = st.session_state["view_company"]
-        row = clients[clients.name == target].iloc[0]
+if "view_company" in st.session_state:
+    target = st.session_state["view_company"]
+
+    # refresh list in case we just added a new company
+    clients = load_clients()
+
+    if target not in clients.name.values:
+        st.warning("That company isn’t in the library yet. Click 'Save to library' on the Dashboard first.")
+        st.stop()
+
+    row = clients[clients.name == target].iloc[0]
 
         st.divider()
         st.header(f"📄 {target} – profile")
