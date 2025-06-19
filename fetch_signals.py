@@ -1,16 +1,15 @@
 """
-fetch_signals.py – Lead Master  v4.1
-• Keyword pre-filter (land/expansion) + fuzzy dedup (80 % overlap)
-• GPT company extraction, summary, daily budget guard
-• Geocode city fallback → lat/lon
+fetch_signals.py – Lead Master v4.2
+• 15-second GDELT timeout + Google-News fallback
+• Progress bar during national scan
+• Keyword pre-filter, fuzzy dedup, GPT company/summary, budget guard
+• HQ-city geocode fallback
 """
 
 import os, json, datetime, logging, textwrap, requests, feedparser
 from collections import defaultdict
 from difflib import SequenceMatcher
-from urllib.parse import urlparse
-
-import pandas as pd
+import streamlit as st                              # NEW for progress bar
 from geopy.geocoders import Nominatim
 from openai import OpenAI
 
@@ -19,9 +18,9 @@ from utils import get_conn, ensure_tables, cache_summary
 # ───────── config & constants ─────────
 client   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 geocoder = Nominatim(user_agent="lead-master")
-MAX_PROSPECTS   = 50          # per scheduled scan
-MAX_HEADLINES   = 50          # per manual search
-DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))  # ≈ $3
+MAX_PROSPECTS   = 50
+MAX_HEADLINES   = 50
+DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))  # ≈ $3/day
 BUDGET_USED     = 0
 
 SEED_KWS = [
@@ -31,26 +30,33 @@ SEED_KWS = [
     "industrial park", "facility renovation"
 ]
 
-def _similar(a, b) -> float:
-    return SequenceMatcher(None, a, b).ratio()
+def _similar(a, b): return SequenceMatcher(None, a, b).ratio()
 
-
-# ───────── headline fetchers & filter ─────────
-def gdelt_search(query: str, max_rec: int = 20):
+# ───────── headline fetcher with fallback ─────────
+def gdelt_or_google(query: str, max_rec: int = 20):
+    """Try GDELT (15 s); on timeout return Google News RSS."""
     url = (
         "https://api.gdeltproject.org/api/v2/doc/docsearch"
         f"?query={query}&maxrecords={max_rec}&format=json"
     )
     try:
-        return requests.get(url, timeout=60).json().get("articles", [])
-    except Exception:
-        return []
+        js = requests.get(url, timeout=15).json()
+        return js.get("articles", [])
+    except Exception as e:
+        logging.warning(f"GDELT timeout: {e} → switching to Google News")
+        feed = feedparser.parse(
+            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+        )
+        today = datetime.datetime.utcnow().strftime("%Y%m%d")
+        return [
+            {"title": ent.title, "url": ent.link, "seendate": today}
+            for ent in feed.entries[:max_rec]
+        ]
 
-
+# ───────── filters & helpers ─────────
 def keyword_filter(title: str) -> bool:
     low = title.lower()
     return any(kw in low for kw in SEED_KWS)
-
 
 def dedup(titles: list[str]) -> list[str]:
     kept = []
@@ -59,31 +65,26 @@ def dedup(titles: list[str]) -> list[str]:
             kept.append(t)
     return kept
 
-
-# ───────── GPT helpers ─────────
-def budget_ok(cost_cents: float) -> bool:
+def budget_ok(cost: float) -> bool:
     global BUDGET_USED
-    if BUDGET_USED + cost_cents > DAILY_BUDGET:
-        logging.warning("Daily GPT budget limit hit – skipping call.")
+    if BUDGET_USED + cost > DAILY_BUDGET:
+        logging.warning("GPT budget exceeded; skipping call.")
         return False
-    BUDGET_USED += cost_cents
+    BUDGET_USED += cost
     return True
 
-
 def gpt_company(headline: str) -> str:
-    if not budget_ok(0.2):
-        return "Unknown"
+    if not budget_ok(0.2): return "Unknown"
     rsp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": f"Primary company in headline: {headline}"}],
+        messages=[{"role":"user","content":f"Primary company in headline: {headline}"}],
         temperature=0, max_tokens=16,
     )
     return rsp.choices[0].message.content.strip().strip('"')
 
-
 def gpt_summary(company: str, heads: list[str]) -> dict:
     if not budget_ok(0.5):
-        return {"summary": heads[0][:120] + "…", "sector": "unknown", "confidence": 0, "land_flag": 0}
+        return {"summary": heads[0][:120]+"…","sector":"unknown","confidence":0,"land_flag":0}
     bullets = "\n".join(f"- {h}" for h in heads[:10])
     prompt = textwrap.dedent(f"""
         Summarise in one sentence. Guess sector. land_flag=1 if land/site purchase implied.
@@ -93,24 +94,21 @@ def gpt_summary(company: str, heads: list[str]) -> dict:
     """)
     rsp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2, max_tokens=220,
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.2,max_tokens=220,
     )
     try:
         return json.loads(rsp.choices[0].message.content.strip())
     except Exception:
         txt = rsp.choices[0].message.content.strip()
-        return {"summary": txt, "sector": "unknown", "confidence": 0, "land_flag": 0}
+        return {"summary":txt,"sector":"unknown","confidence":0,"land_flag":0}
 
-
-# ───────── geocode helper ─────────
 def geocode(text: str):
     try:
         loc = geocoder.geocode(text, timeout=10)
         return (loc.latitude, loc.longitude) if loc else (None, None)
     except Exception:
         return (None, None)
-
 
 # ───────── write to DB ─────────
 def write_signals(rows, conn):
@@ -128,39 +126,39 @@ def write_signals(rows, conn):
         )
     conn.commit()
 
-
-# ───────── national scan (cron & button) ─────────
+# ───────── national scan (cron & manual) ─────────
 def national_scan():
     conn = get_conn(); ensure_tables(conn)
+
     prospects = []
-    for kw in SEED_KWS[:10]:
-        for art in gdelt_search(kw.replace(" ", "%20"), 10):
+    progress = st.progress(0.0)  # Streamlit progress bar
+    for idx, kw in enumerate(SEED_KWS[:10], 1):
+        articles = gdelt_or_google(kw.replace(" ", "%20"), 10)
+        for art in articles:
             title = art["title"]
-            if not keyword_filter(title):
-                continue
-            prospects.append({
-                "headline": title,
-                "url":      art["url"],
-                "date":     art["seendate"][:8],
-                "src":      "scan"
-            })
-            if len(prospects) >= MAX_PROSPECTS:
-                break
-        if len(prospects) >= MAX_PROSPECTS:
-            break
+            if keyword_filter(title):
+                prospects.append({
+                    "headline": title,
+                    "url": art["url"],
+                    "date": art["seendate"][:8],
+                    "src": "scan"
+                })
+                if len(prospects) >= MAX_PROSPECTS: break
+        if len(prospects) >= MAX_PROSPECTS: break
+        progress.progress(idx/10)
 
-    # fuzzy dedup
-    unique = dedup([p["headline"] for p in prospects])
-    prospects = [p for p in prospects if p["headline"] in unique]
+    progress.empty()
 
-    # GPT company extraction + summary per company
-    by_co = defaultdict(list)
+    prospects = [p for p in prospects if keyword_filter(p["headline"])]
+    prospects = [p for p in prospects if p["headline"] in dedup([q["headline"] for q in prospects])]
+
+    by_company = defaultdict(list)
     for p in prospects:
         p["company"] = gpt_company(p["headline"])
-        by_co[p["company"]].append(p)
+        by_company[p["company"]].append(p)
 
     rows = []
-    for co, items in by_co.items():
+    for co, items in by_company.items():
         heads = [i["headline"] for i in items]
         info  = gpt_summary(co, heads)
         for itm in items:
@@ -172,11 +170,7 @@ def national_scan():
             rows.append(itm)
 
         conn.execute(
-            """
-            INSERT OR REPLACE INTO clients
-            (name, summary, sector_tags, status)
-            VALUES (?,?,?, 'New')
-            """,
+            "INSERT OR REPLACE INTO clients (name, summary, sector_tags, status) VALUES (?,?,?, 'New')",
             (co, info["summary"], json.dumps([info["sector"]]))
         )
 
@@ -186,11 +180,10 @@ def national_scan():
 
 # ───────── single-company helper for UI ─────────
 def headlines_for_company(company: str) -> list[dict]:
-    """Return up to MAX_HEADLINES items (last ~150 days)."""
     today  = datetime.date.today()
     start  = today - datetime.timedelta(days=150)
     query  = f'"{company}" AND ({start:%Y%m%d} TO {today:%Y%m%d})'
-    arts   = gdelt_search(query.replace(" ", "%20"), MAX_HEADLINES * 2)
+    arts   = gdelt_or_google(query.replace(" ", "%20"), MAX_HEADLINES * 2)
     res = []
     for a in arts:
         title = a["title"]
@@ -202,7 +195,6 @@ def headlines_for_company(company: str) -> list[dict]:
             break
     return res
 
-
 def manual_search(company: str):
     rows = headlines_for_company(company)
     heads = dedup([r["title"] for r in rows])[:MAX_HEADLINES]
@@ -211,7 +203,7 @@ def manual_search(company: str):
     return info, heads, lat, lon
 
 
-# ───────── CLI entry for cron test ─────────
+# ───────── CLI entry (optional local test) ─────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
     national_scan()
