@@ -1,17 +1,19 @@
 """
-fetch_signals.py – Lead Master  v4.7-b   (2025-06-19)
-• GDELT 15-s timeout; fallback to Google-News RSS
-  ─ Google query: "<company>" (land OR acres OR build …)  → URL-encoded
-• Relaxed keyword filter (keyword OR company name)
+fetch_signals.py  – Lead Master  v4.8   (2025-06-20)
+
+• 15-s GDELT timeout → Google-News RSS fallback
+  – Google query: "<company>" (land OR acres …)   ← URL-encoded
+• Keyword OR company-name filter
+• Duplicate filter: drop when title OR URL repeats
 • GPT-3.5 company extraction  ·  GPT-4o bullet-list summary (throttled)
 • HQ-city geocode fallback
-• PDF export helper (logo, summary, contacts)
+• PDF export (logo, summary, contacts)
 """
 
 import os, json, time, datetime, logging, textwrap, requests, feedparser
 from collections import defaultdict
 from difflib import SequenceMatcher
-from urllib.parse import quote_plus             # ← for URL-encoding
+from urllib.parse import quote_plus
 
 import streamlit as st
 from geopy.geocoders import Nominatim
@@ -47,12 +49,18 @@ def keyword_filter(title: str, company: str | None = None) -> bool:
     co_hit = company and company.lower() in low
     return kw_hit or co_hit
 
-def dedup(titles: list[str]) -> list[str]:
-    kept = []
-    for t in titles:
-        if all(_similar(t, k) < 0.8 for k in kept):
-            kept.append(t)
-    return kept
+def dedup(rows: list[dict]) -> list[dict]:
+    """
+    Remove duplicates when either title OR URL already seen (case-insensitive).
+    Each row must have keys 'title' and 'url'.
+    """
+    seen_titles, seen_urls, out = set(), set(), []
+    for r in rows:
+        t = r["title"].lower(); u = r["url"].lower()
+        if t in seen_titles or u in seen_urls:
+            continue
+        seen_titles.add(t); seen_urls.add(u); out.append(r)
+    return out
 
 def budget_ok(cost: float) -> bool:
     global BUDGET_USED
@@ -139,7 +147,7 @@ def google_news(company: str, max_rec: int = 40):
     kws = " OR ".join(EXTRA_KWS)
     q   = f'"{company}" ({kws})'
     url = ("https://news.google.com/rss/search?"
-           f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en")   # encoded!
+           f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en")
     feed = feedparser.parse(url)
     today = datetime.datetime.utcnow().strftime("%Y%m%d")
     return [{"title":e.title, "url":e.link, "seendate":today}
@@ -170,7 +178,7 @@ def write_signals(rows, conn):
              r["land_flag"], r["sector"], r["lat"], r["lon"]))
     conn.commit()
 
-# ───────── PDF export helpers ─────────
+# ───────── PDF export helpers (unchanged) ─────────
 def fetch_logo(company: str) -> bytes | None:
     try:
         url = f"https://www.google.com/s2/favicons?domain={company}.com&sz=64"
@@ -220,7 +228,7 @@ def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
         f"Source: {row['url']}\nGenerated: {datetime.datetime.now():%Y-%m-%d %H:%M}")
     return pdf.output(dest="S").encode("latin-1")
 
-# ───────── national scan (same logic, uses safe_geocode) ─────────
+# ───────── national scan (uses dedup and safe_geocode) ─────────
 def national_scan():
     conn=get_conn(); ensure_tables(conn)
     prospects=[]; bar=st.progress(0.0)
@@ -234,8 +242,7 @@ def national_scan():
         if len(prospects)>=MAX_PROSPECTS: break
         bar.progress(i/20)
 
-    prospects=[p for p in prospects
-               if p["headline"] in dedup([x["headline"] for x in prospects])]
+    prospects = dedup(prospects)
 
     by_co=defaultdict(list)
     for j,p in enumerate(prospects,1):
@@ -272,18 +279,19 @@ def headlines_for_company(co: str) -> list[dict]:
             if a.get("seendate",
                      today.strftime("%Y%m%d")) >= start.strftime("%Y%m%d")]
 
-    res=[]
+    rows=[]
     for a in arts:
         if keyword_filter(a["title"], co):
-            res.append({"title":a["title"],"url":a["url"],
-                        "date":a.get("seendate", today.strftime("%Y%m%d")),
-                        "src":"search"})
-        if len(res)>=MAX_HEADLINES: break
-    return res
+            rows.append({"title":a["title"],"url":a["url"],
+                         "date":a.get("seendate", today.strftime("%Y%m%d")),
+                         "src":"search"})
+        if len(rows)>=MAX_HEADLINES: break
+    return rows
 
 def manual_search(co: str):
     rows=headlines_for_company(co)
-    heads=dedup([r["title"] for r in rows])[:MAX_HEADLINES]
+    rows=dedup(rows)                           # remove duplicates
+    heads=[r["title"] for r in rows]
     info=gpt_summary(co, heads)
     lat, lon = safe_geocode(info["summary"], co)
-    return info, heads, lat, lon
+    return info, rows, lat, lon
