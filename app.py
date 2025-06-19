@@ -1,123 +1,44 @@
-# app.py – Lead Master  v3
-import streamlit as st
-import pandas as pd
-import json, datetime, feedparser
 
+import streamlit as st, pandas as pd, json, folium, datetime
+from streamlit_folium import st_folium
 from utils import get_conn, ensure_tables
-from fetch_signals import gdelt_headlines, summarise   # ← now guaranteed to exist
+from fetch_signals import summarise, gdelt_headlines
+from pathlib import Path
 
-# ───────── setup ─────────
 st.set_page_config(page_title="Lead Master", layout="wide")
-PAGE = st.sidebar.radio("Pages", ["Dashboard", "Companies"])
+st.markdown("<style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap'); html, body, [class*='css']  {font-family: 'Inter', sans-serif;}</style>", unsafe_allow_html=True)
+# color scheme
+GOLD="#B7932F"; CHAR="#41413F"
+st.markdown(f"<style>.css-18e3th9 {{background-color:#F9F9F9}} .stButton>button{{background:{GOLD};color:white;border:none;border-radius:4px;padding:6px 12px;font-weight:600}}</style>", unsafe_allow_html=True)
 
-conn = get_conn()
-ensure_tables(conn)
+PAGE = st.sidebar.radio("Pages",["Map","Companies"])
 
-@st.cache_data(ttl=3600)
-def load_clients():
-    df = pd.read_sql("SELECT * FROM clients", conn)
-    df["sector_tags"] = df["sector_tags"].apply(json.loads)
-    return df
+conn=get_conn(); ensure_tables(conn)
+clients=pd.read_sql("SELECT * FROM clients",conn)
 
-clients = load_clients()
-
-@st.cache_data(ttl=3600)
-def quick_lookup(name: str):
-    heads = gdelt_headlines(name)
-    return summarise(name, heads) if heads else None
-
-# ───────── Dashboard ─────────
-if PAGE == "Dashboard":
-    st.title("Lead Master – Dashboard")
-
-    search = st.sidebar.text_input("Type a company name")
-    if search and not (clients.name == search).any():
-        info = quick_lookup(search)
-        if info:
-            st.sidebar.success(info["summary"])
-            if st.sidebar.button("Save to library"):
-                conn.execute(
-                    "INSERT OR IGNORE INTO clients (name, summary, sector_tags) VALUES (?,?,?)",
-                    (search, info["summary"], json.dumps([info.get("sector")])),
-                )
-                conn.commit()
-                st.cache_data.clear()
-                st.rerun()
-        else:
-            st.sidebar.warning("No recent signals found.")
-
-    status_sel = st.sidebar.multiselect("Status", ["New", "Contacted", "Proposal", "Won", "Lost"])
-    sector_sel = st.sidebar.multiselect(
-        "Sector tag", sorted({t for tags in clients.sector_tags for t in tags})
-    )
-
-    def filter_df(df):
-        if search:
-            df = df[df.name.str.contains(search, case=False) | df.summary.str.contains(search, case=False)]
-        if status_sel:
-            df = df[df.status.isin(status_sel)]
-        if sector_sel:
-            df = df[df.sector_tags.apply(lambda ts: any(t in ts for t in sector_sel))]
-        return df
-
-    filtered = filter_df(clients)
-    st.dataframe(filtered[["name", "summary", "next_touch"]], height=320)
-
-# ───────── Companies page ─────────
+if PAGE=="Map":
+    st.title("Lead Master — Project Map")
+    # filters
+    sector=st.sidebar.multiselect("Sector tag", sorted({t for tags in clients.sector_tags.apply(json.loads) for t in tags}))
+    today=datetime.date.today()
+    start=st.sidebar.date_input("Start date", today-datetime.timedelta(days=30))
+    end=st.sidebar.date_input("End date", today)
+    df=clients.copy()
+    if sector:
+        df=df[df.sector_tags.apply(lambda s:any(t in json.loads(s) for t in sector))]
+    sig=pd.read_sql("SELECT company,lat,lon,date FROM signals WHERE date BETWEEN ? AND ?",conn,params=(start.strftime("%Y%m%d"),end.strftime("%Y%m%d")))
+    df=df.merge(sig.groupby("company").first().reset_index(),left_on="name",right_on="company",how="left")
+    m=folium.Map(location=[37,-96],zoom_start=4,tiles="CartoDB Positron")
+    for _,r in df.iterrows():
+        if pd.notna(r.lon) and pd.notna(r.lat):
+            folium.Marker(
+                location=[r.lat,r.lon],
+                popup=f"<b>{r.name}</b><br>{r.summary}",
+                icon=folium.Icon(color='orange',icon='info-sign')
+            ).add_to(m)
+    st_folium(m,height=600)
 else:
-    st.title("Saved Companies")
-
-    cols = st.columns(3)
-    idx = 0
-    for _, row in clients.iterrows():
-        with cols[idx]:
-            with st.container(border=True):
-                if row.logo_url:
-                    st.image(row.logo_url, width=96)
-                st.markdown(f"### {row.name}")
-                st.caption(row.summary or "—")
-                if st.button("Open profile ▸", key=f"open_{row.name}"):
-                    st.session_state["view_company"] = row.name
-                    st.rerun()
-        idx = (idx + 1) % 3
-
-if "view_company" in st.session_state:
-    target = st.session_state["view_company"]
-
-    # refresh list in case we just added a new company
-    clients = load_clients()
-
-    if target not in clients.name.values:
-        st.warning("That company isn’t in the library yet. Click 'Save to library' on the Dashboard first.")
-        st.stop()
-
-    row = clients[clients.name == target].iloc[0]
-
-        st.divider()
-        st.header(f"📄 {target} – profile")
-        st.write(row.summary)
-        st.write("**Sector tags:**", ", ".join(json.loads(row.sector_tags)))
-        st.write("**HQ:**", row.hq_address or "—")
-        st.write("**Phone:**", row.phone or "—")
-        if row.website:
-            st.write("**Website:**", row.website)
-
-        contacts = json.loads(row.contacts)
-        if contacts:
-            st.subheader("Contacts")
-            st.table(pd.json_normalize(contacts))
-
-        sig = pd.read_sql(
-            "SELECT date, headline, url FROM signals WHERE company=? ORDER BY date DESC",
-            conn, params=(target,)
-        )
-        if not sig.empty:
-            st.subheader("Recent Signals")
-            for _, s in sig.iterrows():
-                st.markdown(f"*{s.date}* – {s.headline}  [[source]({s.url})]")
-
-        new_notes = st.text_area("Notes", row.notes or "", height=120)
-        if st.button("Save notes"):
-            conn.execute("UPDATE clients SET notes=? WHERE name=?", (new_notes, target))
-            conn.commit()
-            st.success("Notes saved – reload to view.")
+    st.title("Companies")
+    for _,r in clients.iterrows():
+        st.subheader(r.name)
+        st.caption(r.summary or "—")
