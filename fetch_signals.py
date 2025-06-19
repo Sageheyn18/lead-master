@@ -1,22 +1,23 @@
 """
-fetch_signals.py – Lead Master  v4.7   (2025-06-19)
-• 15-s GDELT timeout; on first miss switch to Google-News RSS
-  ─ Google query:  "<company>" (land OR acres OR build OR expansion …)
-• Relaxed keyword filter  (keyword OR company name)
-• GPT-3.5 company extraction (60 RPM)  ·  GPT-4o summary (throttled, bullet list)
+fetch_signals.py – Lead Master  v4.7-b   (2025-06-19)
+• GDELT 15-s timeout; fallback to Google-News RSS
+  ─ Google query: "<company>" (land OR acres OR build …)  → URL-encoded
+• Relaxed keyword filter (keyword OR company name)
+• GPT-3.5 company extraction  ·  GPT-4o bullet-list summary (throttled)
 • HQ-city geocode fallback
-• PDF export helper  (logo, bullet list summary, 3 GPT contacts)
+• PDF export helper (logo, summary, contacts)
 """
 
 import os, json, time, datetime, logging, textwrap, requests, feedparser
 from collections import defaultdict
 from difflib import SequenceMatcher
+from urllib.parse import quote_plus             # ← for URL-encoding
 
 import streamlit as st
 from geopy.geocoders import Nominatim
 from openai import OpenAI, RateLimitError
 from fpdf import FPDF
-import magic                                 # for logo MIME sniff
+import magic
 
 from utils import get_conn, ensure_tables
 
@@ -28,7 +29,7 @@ MAX_PROSPECTS   = 50
 MAX_HEADLINES   = 50
 DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))   # ≈ $3 / day
 BUDGET_USED     = 0
-_4O_LAST_CALL   = 0            # ensure ≥ 21 s between 4-o calls
+_4O_LAST_CALL   = 0            # ≥ 21 s between GPT-4o calls
 
 SEED_KWS = [
     "land purchase", "acres", "buys acreage", "acquire site", "groundbreaking",
@@ -37,7 +38,7 @@ SEED_KWS = [
     "industrial park", "facility renovation"
 ]
 
-# ───────── small helpers ─────────
+# ───────── helper utilities ─────────
 def _similar(a, b): return SequenceMatcher(None, a, b).ratio()
 
 def keyword_filter(title: str, company: str | None = None) -> bool:
@@ -62,14 +63,12 @@ def budget_ok(cost: float) -> bool:
     return True
 
 def safe_chat(**params):
-    """OpenAI wrapper with 3× retries / 21-s back-off."""
     for attempt in range(3):
         try:
             return client.chat.completions.create(**params)
         except RateLimitError:
-            wait = 21
-            logging.warning("Rate-limit; wait %s s  (%s/3)", wait, attempt+1)
-            time.sleep(wait)
+            logging.warning("Rate-limit; wait 21 s  (%s/3)", attempt+1)
+            time.sleep(21)
     logging.error("Still rate-limited after retries.")
     return None
 
@@ -139,19 +138,20 @@ EXTRA_KWS = [
 def google_news(company: str, max_rec: int = 40):
     kws = " OR ".join(EXTRA_KWS)
     q   = f'"{company}" ({kws})'
-    feed = feedparser.parse(
-        f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en")
+    url = ("https://news.google.com/rss/search?"
+           f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en")   # encoded!
+    feed = feedparser.parse(url)
     today = datetime.datetime.utcnow().strftime("%Y%m%d")
     return [{"title":e.title, "url":e.link, "seendate":today}
             for e in feed.entries[:max_rec]]
 
 GDELT_OK = True
-def gdelt_or_google(gdelt_query: str, company: str, max_rec: int = 20):
+def gdelt_or_google(gdelt_q: str, company: str, max_rec: int = 20):
     global GDELT_OK
     if not GDELT_OK:
         return google_news(company, max_rec)
     url = ("https://api.gdeltproject.org/api/v2/doc/docsearch"
-           f"?query={gdelt_query}&maxrecords={max_rec}&format=json")
+           f"?query={gdelt_q}&maxrecords={max_rec}&format=json")
     try:
         return requests.get(url, timeout=15).json().get("articles", [])
     except Exception as e:
@@ -174,8 +174,7 @@ def write_signals(rows, conn):
 def fetch_logo(company: str) -> bytes | None:
     try:
         url = f"https://www.google.com/s2/favicons?domain={company}.com&sz=64"
-        r = requests.get(url, timeout=5)
-        return r.content if r.ok else None
+        r = requests.get(url, timeout=5); return r.content if r.ok else None
     except Exception: return None
 
 def company_contacts(company: str) -> list[dict]:
@@ -221,7 +220,7 @@ def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
         f"Source: {row['url']}\nGenerated: {datetime.datetime.now():%Y-%m-%d %H:%M}")
     return pdf.output(dest="S").encode("latin-1")
 
-# ───────── national scan (uses safe_geocode) ─────────
+# ───────── national scan (same logic, uses safe_geocode) ─────────
 def national_scan():
     conn=get_conn(); ensure_tables(conn)
     prospects=[]; bar=st.progress(0.0)
@@ -269,9 +268,9 @@ def headlines_for_company(co: str) -> list[dict]:
     arts = gdelt_or_google(gdelt_q.replace(" ","%20"), co,
                            MAX_HEADLINES*2)
 
-    # keep only last 150 days (Google items default to today)
     arts = [a for a in arts
-            if a.get("seendate", today.strftime("%Y%m%d")) >= start.strftime("%Y%m%d")]
+            if a.get("seendate",
+                     today.strftime("%Y%m%d")) >= start.strftime("%Y%m%d")]
 
     res=[]
     for a in arts:
