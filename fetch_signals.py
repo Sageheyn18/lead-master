@@ -1,12 +1,14 @@
 """
-fetch_signals.py – Lead Master v 4.6  (2025-06-19)
-• 15-s GDELT timeout → sticky Google-News fallback
-• GPT-3.5-turbo for company name (60 RPM) • GPT-4o-mini (throttled) for summary
-• Relaxed keyword filter (keyword OR company name) • HQ-city geocode fallback
-• PDF export helper (logo, bullet-list summary, contacts)
+fetch_signals.py – Lead Master  v4.7   (2025-06-19)
+• 15-s GDELT timeout; on first miss switch to Google-News RSS
+  ─ Google query:  "<company>" (land OR acres OR build OR expansion …)
+• Relaxed keyword filter  (keyword OR company name)
+• GPT-3.5 company extraction (60 RPM)  ·  GPT-4o summary (throttled, bullet list)
+• HQ-city geocode fallback
+• PDF export helper  (logo, bullet list summary, 3 GPT contacts)
 """
 
-import os, json, time, datetime, logging, textwrap, requests, feedparser, io
+import os, json, time, datetime, logging, textwrap, requests, feedparser
 from collections import defaultdict
 from difflib import SequenceMatcher
 
@@ -14,28 +16,28 @@ import streamlit as st
 from geopy.geocoders import Nominatim
 from openai import OpenAI, RateLimitError
 from fpdf import FPDF
-import magic                        # python-magic
+import magic                                 # for logo MIME sniff
 
 from utils import get_conn, ensure_tables
 
-# ───────── configuration ─────────
+# ───────── CONFIG ─────────
 client   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 geocoder = Nominatim(user_agent="lead-master")
 
 MAX_PROSPECTS   = 50
 MAX_HEADLINES   = 50
-DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))  # ≈ $3 / day
+DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))   # ≈ $3 / day
 BUDGET_USED     = 0
-_4O_LAST_CALL   = 0          # throttle GPT-4o: ≥ 21 s between calls
+_4O_LAST_CALL   = 0            # ensure ≥ 21 s between 4-o calls
 
 SEED_KWS = [
-    "land purchase", "buys acreage", "acquire site", "groundbreaking",
+    "land purchase", "acres", "buys acreage", "acquire site", "groundbreaking",
     "construct", "construction project", "plant expansion", "build new",
     "distribution center", "warehouse", "cold storage", "manufacturing facility",
     "industrial park", "facility renovation"
 ]
 
-# ───────── helper utilities ─────────
+# ───────── small helpers ─────────
 def _similar(a, b): return SequenceMatcher(None, a, b).ratio()
 
 def keyword_filter(title: str, company: str | None = None) -> bool:
@@ -45,39 +47,40 @@ def keyword_filter(title: str, company: str | None = None) -> bool:
     return kw_hit or co_hit
 
 def dedup(titles: list[str]) -> list[str]:
-    out = []
+    kept = []
     for t in titles:
-        if all(_similar(t, k) < .8 for k in out):
-            out.append(t)
-    return out
+        if all(_similar(t, k) < 0.8 for k in kept):
+            kept.append(t)
+    return kept
 
 def budget_ok(cost: float) -> bool:
     global BUDGET_USED
     if BUDGET_USED + cost > DAILY_BUDGET:
-        logging.warning("GPT budget cap hit – skipping call.")
+        logging.warning("GPT budget cap reached; skipping call.")
         return False
     BUDGET_USED += cost
     return True
 
-# GPT wrapper that retries on 429
 def safe_chat(**params):
+    """OpenAI wrapper with 3× retries / 21-s back-off."""
     for attempt in range(3):
         try:
             return client.chat.completions.create(**params)
         except RateLimitError:
-            logging.warning("Rate limit – waiting 21 s (%s/3)", attempt+1)
-            time.sleep(21)
-    logging.error("Rate-limit after 3 retries; returning None.")
+            wait = 21
+            logging.warning("Rate-limit; wait %s s  (%s/3)", wait, attempt+1)
+            time.sleep(wait)
+    logging.error("Still rate-limited after retries.")
     return None
 
 # ───────── GPT helpers ─────────
-def gpt_company(headline: str) -> str:
+def gpt_company(head: str) -> str:
     if not budget_ok(0.05):
         return "Unknown"
     rsp = safe_chat(
         model="gpt-3.5-turbo",
         messages=[{"role":"user",
-                   "content":f"Return ONLY the primary company name in: {headline}"}],
+                   "content":f"Return ONLY the primary company name in: {head}"}],
         temperature=0, max_tokens=16)
     return ("Unknown" if rsp is None
             else rsp.choices[0].message.content.strip().strip('"'))
@@ -98,7 +101,7 @@ def gpt_summary(company: str, heads: list[str]) -> dict:
     prompt = textwrap.dedent(f"""
         Summarise the project info as concise bullet points (max 6 bullets).
         Guess sector. land_flag=1 if land/site purchase implied.
-        Return exact JSON {{summary, sector, confidence, land_flag}}.
+        Return JSON {{summary, sector, confidence, land_flag}}.
         Headlines:
         {"".join("- "+h+"\\n" for h in heads[:10])}
     """)
@@ -116,21 +119,26 @@ def gpt_summary(company: str, heads: list[str]) -> dict:
         txt = rsp.choices[0].message.content.strip()
         return {"summary":txt,"sector":"unknown","confidence":0,"land_flag":0}
 
-# ───────── geocode with HQ fallback ─────────
+# ───────── geocode helpers ─────────
 def geocode(q: str):
     try:
         loc = geocoder.geocode(q, timeout=10)
         return (loc.latitude, loc.longitude) if loc else (None, None)
     except Exception: return (None, None)
 
-def safe_geocode(headline: str, company: str):
-    lat, lon = geocode(headline)
-    if lat is None:
-        lat, lon = geocode(company)
-    return lat, lon
+def safe_geocode(head: str, company: str):
+    lat, lon = geocode(head)
+    return (lat, lon) if lat is not None else geocode(company)
 
 # ───────── headline fetchers ─────────
-def google_news(q: str, max_rec=20):
+EXTRA_KWS = [
+    "land", "acres", "site", "build", "building", "construction",
+    "expansion", "facility", "plant", "warehouse", "distribution center"
+]
+
+def google_news(company: str, max_rec: int = 40):
+    kws = " OR ".join(EXTRA_KWS)
+    q   = f'"{company}" ({kws})'
     feed = feedparser.parse(
         f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en")
     today = datetime.datetime.utcnow().strftime("%Y%m%d")
@@ -138,25 +146,26 @@ def google_news(q: str, max_rec=20):
             for e in feed.entries[:max_rec]]
 
 GDELT_OK = True
-def gdelt_or_google(q: str, max_rec=20):
+def gdelt_or_google(gdelt_query: str, company: str, max_rec: int = 20):
     global GDELT_OK
     if not GDELT_OK:
-        return google_news(q, max_rec)
+        return google_news(company, max_rec)
+    url = ("https://api.gdeltproject.org/api/v2/doc/docsearch"
+           f"?query={gdelt_query}&maxrecords={max_rec}&format=json")
     try:
-        url = (f"https://api.gdeltproject.org/api/v2/doc/docsearch?"
-               f"query={q}&maxrecords={max_rec}&format=json")
         return requests.get(url, timeout=15).json().get("articles", [])
     except Exception as e:
         logging.warning("GDELT timeout → Google (%s)", e)
         GDELT_OK = False
-        return google_news(q, max_rec)
+        return google_news(company, max_rec)
 
 # ───────── DB writer ─────────
 def write_signals(rows, conn):
     for r in rows:
         conn.execute(
-            "INSERT INTO signals (company,date,headline,url,source_label,"
-            " land_flag,sector_guess,lat,lon) VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO signals "
+            "(company,date,headline,url,source_label,land_flag,sector_guess,lat,lon)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (r["company"], r["date"], r["headline"], r["url"], r["src"],
              r["land_flag"], r["sector"], r["lat"], r["lon"]))
     conn.commit()
@@ -167,19 +176,17 @@ def fetch_logo(company: str) -> bytes | None:
         url = f"https://www.google.com/s2/favicons?domain={company}.com&sz=64"
         r = requests.get(url, timeout=5)
         return r.content if r.ok else None
-    except Exception:
-        return None
+    except Exception: return None
 
 def company_contacts(company: str) -> list[dict]:
     if not budget_ok(0.4): return []
-    prompt = ("List max 3 procurement / construction contacts for "
-              f"{company} in JSON (name, title, email, phone).")
+    prompt = ("Give a JSON list (max 3) of procurement / construction contacts "
+              f"for {company}. Fields: name, title, email, phone.")
     rsp = safe_chat(model="gpt-3.5-turbo",
                     messages=[{"role":"user","content":prompt}],
                     temperature=0, max_tokens=256)
     if rsp is None: return []
-    try:
-        return json.loads(rsp.choices[0].message.content.strip())
+    try: return json.loads(rsp.choices[0].message.content.strip())
     except Exception: return []
 
 def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
@@ -209,17 +216,18 @@ def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
             pdf.ln(1)
 
     pdf.set_y(-30); pdf.set_font("Helvetica", "I", 9)
-    pdf.multi_cell(0, 5,
+    pdf.multi_cell(
+        0, 5,
         f"Source: {row['url']}\nGenerated: {datetime.datetime.now():%Y-%m-%d %H:%M}")
     return pdf.output(dest="S").encode("latin-1")
 
-# ───────── national scan (same logic, uses safe_geocode) ─────────
+# ───────── national scan (uses safe_geocode) ─────────
 def national_scan():
     conn=get_conn(); ensure_tables(conn)
     prospects=[]; bar=st.progress(0.0)
 
     for i,kw in enumerate(SEED_KWS[:10],1):
-        for art in gdelt_or_google(kw.replace(" ","%20"),10):
+        for art in gdelt_or_google(kw.replace(" ","%20"), "", 10):
             if keyword_filter(art["title"]):
                 prospects.append({"headline":art["title"],"url":art["url"],
                                   "date":art["seendate"][:8],"src":"scan"})
@@ -257,13 +265,20 @@ def national_scan():
 # ───────── manual search helper ─────────
 def headlines_for_company(co: str) -> list[dict]:
     today=datetime.date.today(); start=today-datetime.timedelta(days=150)
-    q=f'"{co}" AND ({start:%Y%m%d} TO {today:%Y%m%d})'
-    arts=gdelt_or_google(q.replace(" ","%20"), MAX_HEADLINES*2)
+    gdelt_q = f'"{co}" AND ({start:%Y%m%d} TO {today:%Y%m%d})'
+    arts = gdelt_or_google(gdelt_q.replace(" ","%20"), co,
+                           MAX_HEADLINES*2)
+
+    # keep only last 150 days (Google items default to today)
+    arts = [a for a in arts
+            if a.get("seendate", today.strftime("%Y%m%d")) >= start.strftime("%Y%m%d")]
+
     res=[]
     for a in arts:
         if keyword_filter(a["title"], co):
             res.append({"title":a["title"],"url":a["url"],
-                        "date":a["seendate"][:8],"src":"search"})
+                        "date":a.get("seendate", today.strftime("%Y%m%d")),
+                        "src":"search"})
         if len(res)>=MAX_HEADLINES: break
     return res
 
