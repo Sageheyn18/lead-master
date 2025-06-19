@@ -1,9 +1,19 @@
-streamlit>=1.35.0
-openai>=1.23.0
-pandas>=2.2.0
-requests>=2.31.0
-feedparser>=6.0.10
-beautifulsoup4>=4.12.3
-folium>=0.15.0
-streamlit-folium>=0.15.0
-geopy>=2.4.0
+# Lead Master – all libraries needed to run the app end-to-end
+# -----------------------------------------------------------
+# UI, layout, map
+streamlit>=1.26,<2.0
+folium>=0.15
+streamlit-folium>=0.20
+
+# Data handling
+pandas>=2.2
+requests>=2.31
+feedparser>=6.0
+geopy>=2.4
+
+# OpenAI API
+openai>=1.10
+
+# PDF generation & logo MIME sniff (for “Export PDF” feature)
+fpdf2==2.7.7
+python-magic>=0.4.27
