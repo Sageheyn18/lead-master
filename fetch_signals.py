@@ -1,10 +1,10 @@
 """
-fetch_signals.py – Lead Master  v4.4
-▪ 15-second GDELT timeout; after first miss we stick to Google News
-▪ Streamlit progress bar covers all phases (0 → 100 %)
-▪ GPT calls wrapped with 20 s back-off on RateLimitError
-▪ Keyword pre-filter, fuzzy dedup (≥ 80 %)
-▪ GPT daily-budget guard, HQ-city geocode fallback
+fetch_signals.py – Lead Master  v4.4-a
+• 15-second GDELT timeout; after first miss we stick to Google News
+• Progress bar covers all phases (0 → 100 %)
+• GPT calls wrapped with 20 s back-off on RateLimitError
+• Keyword pre-filter, fuzzy dedup (≥ 80 %)
+• GPT daily-budget guard, HQ-city geocode fallback → lat/lon
 """
 
 import os, json, time, datetime, logging, textwrap, requests, feedparser
@@ -13,8 +13,7 @@ from difflib import SequenceMatcher
 
 import streamlit as st
 from geopy.geocoders import Nominatim
-from openai import OpenAI
-from openai.error import RateLimitError
+from openai import OpenAI, RateLimitError        # ← fixed import
 
 from utils import get_conn, ensure_tables
 
@@ -22,10 +21,10 @@ from utils import get_conn, ensure_tables
 client   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 geocoder = Nominatim(user_agent="lead-master")
 
-MAX_PROSPECTS   = 50          # per scheduled scan
-MAX_HEADLINES   = 50          # per manual search
+MAX_PROSPECTS   = 50           # per scheduled scan
+MAX_HEADLINES   = 50           # per manual search
 DAILY_BUDGET    = int(os.getenv("DAILY_BUDGET_CENTS", "300"))  # ≈ $3/day
-BUDGET_USED     = 0
+BUDGET_USED     = 0            # tracked each run
 
 SEED_KWS = [
     "land purchase", "buys acreage", "acquire site", "groundbreaking",
@@ -34,7 +33,7 @@ SEED_KWS = [
     "industrial park", "facility renovation"
 ]
 
-# ───────── helper functions ─────────
+# ───────── helpers ─────────
 def _similar(a, b): return SequenceMatcher(None, a, b).ratio()
 
 def keyword_filter(title: str) -> bool:
@@ -75,7 +74,7 @@ def gpt_company(headline: str) -> str:
         return "Unknown"
     rsp = safe_chat(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content":f"Primary company in headline: {headline}"}],
+        messages=[{"role": "user", "content": f"Primary company in headline: {headline}"}],
         temperature=0, max_tokens=16,
     )
     if rsp is None: return "Unknown"
@@ -130,7 +129,7 @@ def google_news(query: str, max_rec: int = 20):
 GDELT_WORKING = True   # sticky flag (per scan run)
 
 def gdelt_or_google(query: str, max_rec: int = 20):
-    """Try GDELT (15 s). After first timeout, stick to Google for remainder."""
+    """Try GDELT (15 s). After first timeout, stick to Google News."""
     global GDELT_WORKING
     if not GDELT_WORKING:
         return google_news(query, max_rec)
@@ -185,12 +184,12 @@ def national_scan():
                     break
         if len(prospects) >= MAX_PROSPECTS:
             break
-        progress.progress(i / 20)          # 10 keywords → 0–0.5
+        progress.progress(i / 20)          # 10 keywords maps to 0–0.5
 
     prospects = [p for p in prospects
                  if p["headline"] in dedup([q["headline"] for q in prospects])]
 
-    # Phase 2 – company extraction (50–80 %)
+    # Phase 2 – GPT company extraction (50–80 %)
     by_company = defaultdict(list)
     for j, p in enumerate(prospects, 1):
         p["company"] = gpt_company(p["headline"])
@@ -224,7 +223,7 @@ def national_scan():
     progress.empty()
     logging.info("Scan wrote %s signals", len(rows))
 
-# ───────── single-company helper for UI ─────────
+# ───────── manual search helper for UI ─────────
 def headlines_for_company(company: str) -> list[dict]:
     today  = datetime.date.today()
     start  = today - datetime.timedelta(days=150)
