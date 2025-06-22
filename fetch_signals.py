@@ -1,4 +1,4 @@
-# fetch_signals.py  – Lead Master  v6.0   (2025-06-22)
+# fetch_signals.py  – Lead Master  v6.1   (2025-06-22)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3
 from collections import defaultdict
@@ -7,7 +7,6 @@ from urllib.parse     import quote_plus
 import feedparser, streamlit as st
 from geopy.geocoders  import Nominatim
 from openai           import OpenAI, RateLimitError
-from newsapi          import NewsApiClient
 
 from utils import get_conn, ensure_tables
 
@@ -17,7 +16,6 @@ client           = OpenAI(api_key=OPENAI_KEY)
 geocoder         = Nominatim(user_agent="lead-master")
 
 NEWSAPI_KEY      = "cde04d56b1f7429a84cb3f834791fad7"
-newsapi          = NewsApiClient(api_key=NEWSAPI_KEY)
 
 MAX_PROSPECTS    = 100
 MAX_HEADLINES    = 20
@@ -97,22 +95,27 @@ def safe_geocode(head, co):
         lat,lon = _geo(f"{co} headquarters")
     return lat,lon
 
-# ───────── NEWSAPI (replacing GDELT) ─────────
+# ───────── NEWSAPI VIA REQUESTS ─────────
 def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
     key = f"newsapi:{query}:{maxrec}"
     cached = _cached(key)
     if cached is not None:
         return cached
 
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "apiKey": NEWSAPI_KEY,
+        "q": query,
+        "pageSize": maxrec,
+        "sortBy": "publishedAt",
+        "language": "en"
+    }
     try:
-        resp = newsapi.get_everything(
-            q=query, page_size=maxrec,
-            sort_by="publishedAt", language="en"
-        )
-        arts = resp.get("articles",[])
+        resp = requests.get(url, params=params, timeout=15).json()
+        arts = resp.get("articles", [])
         out  = [
-            {"title":a["title"], "url":a["url"],
-             "seendate":a["publishedAt"][:10].replace("-","")}
+            {"title": a.get("title",""), "url": a.get("url",""),
+             "seendate": a.get("publishedAt","")[:10].replace("-","")}
             for a in arts
         ]
     except Exception as e:
@@ -159,7 +162,7 @@ def gpt_batch_signal_info(headlines, chunk=10):
                 continue
             except:
                 pass
-        # fallback to individual
+        # fallback to per-headline
         for h in batch:
             tmp = gpt_signal_info(h)
             results.append({"headline":h, **tmp})
@@ -243,8 +246,7 @@ def write_signals(rows, conn):
 # ───────── NATIONAL SCAN ─────────
 def national_scan():
     conn = get_conn(); ensure_tables(conn)
-    prospects=[]
-    bar=st.progress(0.0)
+    prospects=[]; bar=st.progress(0.0)
 
     for i, kw in enumerate(SEED_KWS, start=1):
         arts = gdelt_headlines(kw, MAX_PROSPECTS)
@@ -261,21 +263,20 @@ def national_scan():
     prospects = dedup(prospects)
     logging.info(f"Found {len(prospects)} prospects")
 
-    # batch relevance
     infos = gpt_batch_signal_info([p["headline"] for p in prospects])
     by_co = defaultdict(list)
     for p in prospects:
         for inf in infos:
-            if inf["headline"]==p["headline"] and inf["score"]>=RELEVANCE_CUTOFF:
-                p["company"]=inf["company"]
+            if inf["headline"] == p["headline"] and inf["score"] >= RELEVANCE_CUTOFF:
+                p["company"] = inf["company"]
                 by_co[inf["company"]].append(p)
                 break
 
     rows=[]
     for co, items in by_co.items():
-        heads= [it["headline"] for it in items]
-        summ= gpt_summary(co, heads)
-        contacts= company_contacts(co)
+        heads = [it["headline"] for it in items]
+        summ  = gpt_summary(co, heads)
+        contacts = company_contacts(co)
         # persist contacts
         for c in contacts:
             conn.execute(
@@ -291,13 +292,12 @@ def national_scan():
             " VALUES(?,?,?,?,?,?)",
             (co, summ["summary"], json.dumps([summ["sector"]]), "New", lat, lon)
         )
-
         for it in items:
             it.update({
-                "land_flag": summ["land_flag"],
-                "sector": summ["sector"],
+                "land_flag":  summ["land_flag"],
+                "sector":     summ["sector"],
                 "confidence": summ["confidence"],
-                "lat": lat, "lon": lon
+                "lat":        lat, "lon": lon
             })
             rows.append(it)
 
