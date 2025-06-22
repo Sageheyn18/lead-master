@@ -1,11 +1,10 @@
-# fetch_signals.py  – Lead Master  v6.2   (2025-06-22)
+# fetch_signals.py  – Lead Master  v6.3   (2025-06-22)
 
-import os, json, time, datetime, logging, textwrap, requests, sqlite3
+import os, json, time, datetime, logging, textwrap, requests, sqlite3, csv
 from collections import defaultdict
 from urllib.parse     import quote_plus
 
-import feedparser
-import streamlit as st
+import feedparser, streamlit as st
 from geopy.geocoders  import Nominatim
 from openai           import OpenAI, RateLimitError
 from fpdf             import FPDF
@@ -37,8 +36,10 @@ SEED_KWS = [
 EXTRA_KWS = ["land","acres","site","build","construction","expansion","facility"]
 
 # ───────── LOCAL CACHE ─────────
-_cache = sqlite3.connect(os.path.join(os.getcwd(),"rss_gdelt_cache.db"),
-                        check_same_thread=False)
+_cache = sqlite3.connect(
+    os.path.join(os.getcwd(),"rss_gdelt_cache.db"),
+    check_same_thread=False
+)
 _cache.execute("""
 CREATE TABLE IF NOT EXISTS cache(
   key   TEXT PRIMARY KEY,
@@ -48,7 +49,9 @@ CREATE TABLE IF NOT EXISTS cache(
 _cache.commit()
 
 def _cached(key, ttl=86400):
-    row = _cache.execute("SELECT data,ts FROM cache WHERE key=?", (key,)).fetchone()
+    row = _cache.execute(
+        "SELECT data,ts FROM cache WHERE key=?", (key,)
+    ).fetchone()
     now = int(time.time())
     if row and now-row[1] < ttl:
         return json.loads(row[0])
@@ -83,20 +86,24 @@ def dedup(rows):
     for r in rows:
         t = (r.get("title","") or r.get("headline","")).lower()
         u = r.get("url","").lower()
-        if t in seen_t or u in seen_u: continue
-        seen_t.add(t); seen_u.add(u); out.append(r)
+        if t in seen_t or u in seen_u: 
+            continue
+        seen_t.add(t); seen_u.add(u)
+        out.append(r)
     return out
 
 def _geo(q):
-    try: loc = geocoder.geocode(q, timeout=10)
-    except: loc = None
+    try:
+        loc = geocoder.geocode(q, timeout=10)
+    except:
+        loc = None
     return (loc.latitude,loc.longitude) if loc else (None,None)
 
 def safe_geocode(head, co):
-    lat,lon = _geo(head)
+    lat, lon = _geo(head)
     if lat is None or lon is None:
-        lat,lon = _geo(f"{co} headquarters")
-    return lat,lon
+        lat, lon = _geo(f"{co} headquarters")
+    return lat, lon
 
 # ───────── NEWSAPI VIA REQUESTS ─────────
 def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
@@ -297,6 +304,31 @@ def manual_search(company: str):
     lat, lon = safe_geocode("", company)
     return info, heads, lat, lon
 
+# ───────── PERMITS IMPORT ─────────
+def fetch_permits():
+    """
+    Expects a 'permits.csv' in the app root with columns:
+      company,address,date,permit_type,details_url
+    """
+    fpath = os.path.join(os.getcwd(), "permits.csv")
+    if not os.path.exists(fpath):
+        return []
+    permits = []
+    with open(fpath, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            lat, lon = safe_geocode(row.get("address",""), row.get("company",""))
+            permits.append({
+                "company":     row.get("company",""),
+                "address":     row.get("address",""),
+                "date":        row.get("date",""),
+                "type":        row.get("permit_type",""),
+                "details_url": row.get("details_url",""),
+                "lat":         lat,
+                "lon":         lon
+            })
+    return permits
+
 # ───────── DB WRITERS ─────────
 def write_signals(rows: list[dict], conn):
     for r in rows:
@@ -350,7 +382,7 @@ def national_scan():
                  c.get("email",""),c.get("phone",""))
             )
         lat, lon = safe_geocode("", co)
-        conn.execute(
+        conn.execute(  # store or update HQ coords
             "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon)"
             " VALUES(?,?,?,?,?,?)",
             (co, summ["summary"], json.dumps([summ["sector"]]), "New", lat, lon)
@@ -360,7 +392,8 @@ def national_scan():
                 "land_flag":  summ["land_flag"],
                 "sector":     summ["sector"],
                 "confidence": summ["confidence"],
-                "lat":        lat, "lon": lon
+                "lat":        lat,
+                "lon":        lon
             })
             rows.append(it)
 
