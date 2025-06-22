@@ -1,91 +1,64 @@
-"""
-utils.py – Lead Master  v4.1
-• SQLite helpers   • Table creator (lat / lon / read_flag)
-• Tiny URL→summary cache
-"""
+import os
+import sqlite3
 
-import sqlite3, hashlib, json, os, logging, datetime
+# Database file path (change as needed)
+DB_PATH = os.getenv("DB_PATH", "leadmaster.db")
 
-DB_PATH  = "lead_master.db"
-CACHE_DB = "cache.sqlite"
+def get_conn():
+    """
+    Return a SQLite connection (thread-safe).
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+def ensure_tables(conn):
+    """
+    Create all required tables if they don't exist:
+     • signals
+     • clients
+     • contacts
+     • rss_cache
+    """
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      company       TEXT,
+      date          TEXT,
+      headline      TEXT,
+      url           TEXT,
+      source_label  TEXT,
+      land_flag     INTEGER,
+      sector_guess  TEXT,
+      lat           REAL,
+      lon           REAL,
+      read_flag     INTEGER DEFAULT 0
+    )""")
 
-def get_conn(db: str = DB_PATH) -> sqlite3.Connection:
-    """Return thread-safe SQLite connection."""
-    return sqlite3.connect(db, check_same_thread=False)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+      name         TEXT PRIMARY KEY,
+      summary      TEXT,
+      sector_tags  TEXT,
+      status       TEXT,
+      notes        TEXT
+    )""")
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS contacts (
+      company  TEXT,
+      name     TEXT,
+      title    TEXT,
+      email    TEXT,
+      phone    TEXT,
+      UNIQUE(company,name,title,email)
+    )""")
 
-# ───────── ensure tables (adds cols if missing) ─────────
-def ensure_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS clients(
-            name          TEXT PRIMARY KEY,
-            summary       TEXT,
-            sector_tags   TEXT DEFAULT '[]',
-            status        TEXT DEFAULT 'New',
-            hq_address    TEXT,
-            phone         TEXT,
-            website       TEXT,
-            logo_url      TEXT,
-            facilities    TEXT DEFAULT '[]',
-            contacts      TEXT DEFAULT '[]',
-            next_touch    TEXT,
-            notes         TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS signals(
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            company       TEXT,
-            date          TEXT,
-            headline      TEXT,
-            url           TEXT,
-            source_label  TEXT,
-            land_flag     INTEGER DEFAULT 0,
-            sector_guess  TEXT,
-            lat           REAL,
-            lon           REAL,
-            read_flag     INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS kw_cache(
-            id       INTEGER PRIMARY KEY,
-            keywords TEXT,
-            updated  TEXT
-        );
-        """
-    )
-
-    # ── add missing columns in existing DBs ──
-    cols = {c[1] for c in conn.execute("PRAGMA table_info(signals)")}
-    for col, sql in [
-        ("lat",  "ALTER TABLE signals ADD COLUMN lat REAL"),
-        ("lon",  "ALTER TABLE signals ADD COLUMN lon REAL"),
-        ("read_flag", "ALTER TABLE signals ADD COLUMN read_flag INTEGER DEFAULT 0"),
-    ]:
-        if col not in cols:
-            conn.execute(sql)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS rss_cache (
+      query  TEXT PRIMARY KEY,
+      data   TEXT,
+      ts     INTEGER
+    )""")
 
     conn.commit()
-
-
-# ───────── tiny cache for GPT summaries ─────────
-def _h(url: str) -> str:
-    return hashlib.sha256(url.encode()).hexdigest()
-
-
-def cache_summary(url: str, summary: str | None = None) -> str | None:
-    c = get_conn(CACHE_DB)
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS cache(urlhash TEXT PRIMARY KEY, summary TEXT)"
-    )
-    if summary is None:
-        row = c.execute(
-            "SELECT summary FROM cache WHERE urlhash=?", (_h(url),)
-        ).fetchone()
-        return None if row is None else row[0]
-    c.execute(
-        "INSERT OR REPLACE INTO cache(urlhash, summary) VALUES(?,?)",
-        (_h(url), summary),
-    )
-    c.commit()
