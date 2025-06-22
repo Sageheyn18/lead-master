@@ -1,4 +1,4 @@
-# fetch_signals.py  – Lead Master  v6.3   (2025-06-22)
+# fetch_signals.py  – Lead Master  v6.4   (2025-06-23)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3, csv
 from collections import defaultdict
@@ -23,7 +23,8 @@ MAX_PROSPECTS    = 100
 MAX_HEADLINES    = 20
 DAILY_BUDGET     = int(os.getenv("DAILY_BUDGET_CENTS","300"))
 BUDGET_USED      = 0
-_4O_LAST_CALL    = 0
+# throttle: ensure ≥20s between summary calls
+_LAST_SUMMARY    = 0
 RELEVANCE_CUTOFF = 0.45
 
 SEED_KWS = [
@@ -86,7 +87,7 @@ def dedup(rows):
     for r in rows:
         t = (r.get("title","") or r.get("headline","")).lower()
         u = r.get("url","").lower()
-        if t in seen_t or u in seen_u: 
+        if t in seen_t or u in seen_u:
             continue
         seen_t.add(t); seen_u.add(u)
         out.append(r)
@@ -114,8 +115,8 @@ def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
 
     url    = "https://newsapi.org/v2/everything"
     params = {
-        "apiKey": NEWSAPI_KEY,
-        "q":      query,
+        "apiKey":   NEWSAPI_KEY,
+        "q":        query,
         "pageSize": maxrec,
         "sortBy":   "publishedAt",
         "language": "en"
@@ -156,8 +157,8 @@ def google_news(co, maxrec=MAX_HEADLINES):
     _store(key, out)
     return out
 
-# ───────── BATCHED SIGNAL INFO ─────────
-def gpt_batch_signal_info(headlines, chunk=10):
+# ───────── BATCHED SIGNAL INFO (chunk=5) ─────────
+def gpt_batch_signal_info(headlines, chunk=5):
     results=[]
     for i in range(0, len(headlines), chunk):
         batch = headlines[i:i+chunk]
@@ -176,7 +177,7 @@ def gpt_batch_signal_info(headlines, chunk=10):
                 continue
             except:
                 pass
-        # fallback to individual calls
+        # fallback to individual
         for h in batch:
             tmp = gpt_signal_info(h)
             results.append({"headline":h, **tmp})
@@ -200,17 +201,22 @@ def gpt_signal_info(head):
     except:
         return {"company":"Unknown","score":0.0}
 
-# ───────── GPT SUMMARY ─────────
+# ───────── SUMMARY switched to gpt-3.5-turbo & throttled ─────────
 def gpt_summary(co, heads):
-    global _4O_LAST_CALL
-    if not heads:
-        return {"summary":"No signals","sector":"unknown","confidence":0,"land_flag":0}
-    wait = 21 - (time.time() - _4O_LAST_CALL)
+    global _LAST_SUMMARY
+    # ensure ≥20s between calls
+    wait = 20 - (time.time() - _LAST_SUMMARY)
     if wait>0:
         time.sleep(wait)
+    _LAST_SUMMARY = time.time()
+
+    if not heads:
+        return {"summary":"No signals","sector":"unknown","confidence":0,"land_flag":0}
+
     cost = 0.5
     if not budget_ok(cost):
         return {"summary":heads[0][:120]+"…","sector":"unknown","confidence":0,"land_flag":0}
+
     prompt = textwrap.dedent(f"""
         Summarise in 5 bullets. Guess sector. land_flag=1 if land purchase.
         Return EXACT JSON {{summary,sector,confidence,land_flag}}.
@@ -218,17 +224,19 @@ def gpt_summary(co, heads):
         Headlines:
         {"".join("- "+h+"\\n" for h in heads[:10])}
     """).strip()
+
     rsp = safe_chat(
-        model="gpt-4o-mini",
+        model="gpt-3.5-turbo",
         messages=[{"role":"user","content":prompt}],
         temperature=0.2, max_tokens=220
     )
-    _4O_LAST_CALL = time.time()
     if not rsp:
         return {"summary":heads[0][:120]+"…","sector":"unknown","confidence":0,"land_flag":0}
+
     try:
         return json.loads(rsp.choices[0].message.content)
     except:
+        # fallback to plain text summary
         return {"summary":rsp.choices[0].message.content,"sector":"unknown","confidence":0,"land_flag":0}
 
 # ───────── CONTACTS ─────────
@@ -290,7 +298,7 @@ def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
     )
     return pdf.output(dest="S").encode("latin-1")
 
-# ───────── MANUAL SEARCH FOR UI ─────────
+# ───────── MANUAL SEARCH ─────────
 def manual_search(company: str):
     arts = gdelt_headlines(company, MAX_HEADLINES)
     if not arts:
@@ -300,36 +308,32 @@ def manual_search(company: str):
     heads = [a["title"] for a in arts][:MAX_HEADLINES]
     if not heads:
         return None, [], None, None
+
     info = gpt_summary(company, heads)
     lat, lon = safe_geocode("", company)
     return info, heads, lat, lon
 
 # ───────── PERMITS IMPORT ─────────
 def fetch_permits():
-    """
-    Expects a 'permits.csv' in the app root with columns:
-      company,address,date,permit_type,details_url
-    """
     fpath = os.path.join(os.getcwd(), "permits.csv")
     if not os.path.exists(fpath):
         return []
-    permits = []
+    permits=[]
     with open(fpath, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader=csv.DictReader(f)
         for row in reader:
             lat, lon = safe_geocode(row.get("address",""), row.get("company",""))
             permits.append({
-                "company":     row.get("company",""),
-                "address":     row.get("address",""),
-                "date":        row.get("date",""),
-                "type":        row.get("permit_type",""),
+                "company": row.get("company",""),
+                "address": row.get("address",""),
+                "date":    row.get("date",""),
+                "type":    row.get("permit_type",""),
                 "details_url": row.get("details_url",""),
-                "lat":         lat,
-                "lon":         lon
+                "lat":     lat, "lon": lon
             })
     return permits
 
-# ───────── DB WRITERS ─────────
+# ───────── WRITE & SCAN ─────────
 def write_signals(rows: list[dict], conn):
     for r in rows:
         conn.execute(
@@ -340,7 +344,6 @@ def write_signals(rows: list[dict], conn):
         )
     conn.commit()
 
-# ───────── NATIONAL SCAN ─────────
 def national_scan():
     conn = get_conn(); ensure_tables(conn)
     prospects=[]; bar=st.progress(0.0)
@@ -352,13 +355,14 @@ def national_scan():
         for a in arts:
             if any(ek in a["title"].lower() for ek in EXTRA_KWS):
                 prospects.append({
-                    "headline":a["title"],"url":a["url"],
-                    "date":a["seendate"][:8],"src":"scan"
+                    "headline": a["title"],
+                    "url":      a["url"],
+                    "date":     a["seendate"][:8],
+                    "src":      "scan"
                 })
         bar.progress(i/len(SEED_KWS))
 
     prospects = dedup(prospects)
-    logging.info(f"Found {len(prospects)} prospects")
 
     infos = gpt_batch_signal_info([p["headline"] for p in prospects])
     by_co = defaultdict(list)
@@ -371,8 +375,8 @@ def national_scan():
 
     rows=[]
     for co, items in by_co.items():
-        heads = [it["headline"] for it in items]
-        summ  = gpt_summary(co, heads)
+        heads    = [it["headline"] for it in items]
+        summ     = gpt_summary(co, heads)
         contacts = company_contacts(co)
         for c in contacts:
             conn.execute(
@@ -382,18 +386,18 @@ def national_scan():
                  c.get("email",""),c.get("phone",""))
             )
         lat, lon = safe_geocode("", co)
-        conn.execute(  # store or update HQ coords
+        conn.execute(
             "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon)"
             " VALUES(?,?,?,?,?,?)",
-            (co, summ["summary"], json.dumps([summ["sector"]]), "New", lat, lon)
+            (co, summ["summary"], json.dumps([summ["sector"]]),
+             "New", lat, lon)
         )
         for it in items:
             it.update({
                 "land_flag":  summ["land_flag"],
                 "sector":     summ["sector"],
                 "confidence": summ["confidence"],
-                "lat":        lat,
-                "lon":        lon
+                "lat":        lat, "lon": lon
             })
             rows.append(it)
 
