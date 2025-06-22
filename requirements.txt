@@ -1,19 +1,12 @@
-# Lead Master – all libraries needed to run the app end-to-end
-# -----------------------------------------------------------
-# UI, layout, map
-streamlit>=1.26,<2.0
-folium>=0.15
-streamlit-folium>=0.20
-
-# Data handling
-pandas>=2.2
-requests>=2.31
-feedparser>=6.0
-geopy>=2.4
-
-# OpenAI API
-openai>=1.10
-
-# PDF generation & logo MIME sniff (for “Export PDF” feature)
-fpdf2==2.7.7
-python-magic>=0.4.27
+streamlit>=1.26
+streamlit-folium
+streamlit-aggrid
+pandas
+folium
+openai
+fpdf
+python-magic
+feedparser
+geopy
+Pillow
+requests
