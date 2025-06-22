@@ -1,4 +1,4 @@
-# app.py – Lead Master v5.7  (2025-06-22)
+# app.py – Lead Master v5.8  (2025-06-22)
 import os, json, datetime, pandas as pd, folium, streamlit as st
 from streamlit_folium import st_folium
 from PIL import Image
@@ -71,7 +71,6 @@ with st.sidebar:
 
     # ───────── Page Navigation ─────────
     st.markdown("## Menu")
-    # now only emoji, label separate
     pages = [
         ("🗺️", "Map"),
         ("🏭", "Companies"),
@@ -111,8 +110,9 @@ with st.sidebar:
 conn = get_conn(); ensure_tables(conn)
 page = st.session_state.get("page","Map")
 
-# handle voice commands (simple stub)
-for msg in st.experimental_get_query_params().get("VOICE", []):
+# handle voice commands (stub)
+voice_params = st.query_params.get("VOICE", [])
+for msg in voice_params:
     cmd = msg.lower()
     if "national scan" in cmd:
         national_scan()
@@ -201,7 +201,6 @@ else:
                 HeatMap(pts).add_to(m)
 
         for _, r in df.iterrows():
-            # Skip any with missing coords
             if r.lat is None or r.lon is None:
                 continue
             folium.Marker(
@@ -311,13 +310,13 @@ else:
         </body></html>
         """, height=600)
 
-        if 'PIPELINE' in st.experimental_get_query_params():
-            new = json.loads(st.experimental_get_query_params()['PIPELINE'][0])
+        qs = st.query_params
+        if 'PIPELINE' in qs:
+            new = json.loads(qs['PIPELINE'][0])
             for lane in new['lanes']:
                 for c in lane['cards']:
                     conn.execute(
-                        "UPDATE clients SET status=? WHERE name=?",
-                        (lane['id'], c['id'])
+                        "UPDATE clients SET status=? WHERE name=?", (lane['id'], c['id'])
                     )
             conn.commit()
             _rerun()
