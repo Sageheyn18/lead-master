@@ -1,4 +1,4 @@
-# fetch_signals.py  – Lead Master  v6.4   (2025-06-23)
+# fetch_signals.py  – Lead Master  v6.5   (2025-06-23)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3, csv
 from collections import defaultdict
@@ -23,7 +23,8 @@ MAX_PROSPECTS    = 100
 MAX_HEADLINES    = 20
 DAILY_BUDGET     = int(os.getenv("DAILY_BUDGET_CENTS","300"))
 BUDGET_USED      = 0
-# throttle: ensure ≥20s between summary calls
+# throttle between GPT-4 calls (seconds)
+SUMMARY_THROTTLE = 10
 _LAST_SUMMARY    = 0
 RELEVANCE_CUTOFF = 0.45
 
@@ -50,9 +51,7 @@ CREATE TABLE IF NOT EXISTS cache(
 _cache.commit()
 
 def _cached(key, ttl=86400):
-    row = _cache.execute(
-        "SELECT data,ts FROM cache WHERE key=?", (key,)
-    ).fetchone()
+    row = _cache.execute("SELECT data,ts FROM cache WHERE key=?", (key,)).fetchone()
     now = int(time.time())
     if row and now-row[1] < ttl:
         return json.loads(row[0])
@@ -94,10 +93,8 @@ def dedup(rows):
     return out
 
 def _geo(q):
-    try:
-        loc = geocoder.geocode(q, timeout=10)
-    except:
-        loc = None
+    try: loc = geocoder.geocode(q, timeout=10)
+    except: loc = None
     return (loc.latitude,loc.longitude) if loc else (None,None)
 
 def safe_geocode(head, co):
@@ -125,11 +122,7 @@ def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
         resp = requests.get(url, params=params, timeout=15).json()
         arts = resp.get("articles", [])
         out  = [
-            {
-              "title":    a.get("title",""),
-              "url":      a.get("url",""),
-              "seendate": a.get("publishedAt","")[:10].replace("-","")
-            }
+            {"title":a.get("title",""), "url":a.get("url",""), "seendate":a.get("publishedAt","")[:10].replace("-","")}
             for a in arts
         ]
     except Exception as e:
@@ -150,15 +143,13 @@ def google_news(co, maxrec=MAX_HEADLINES):
            f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en")
     feed = feedparser.parse(url)
     today= datetime.datetime.utcnow().strftime("%Y%m%d")
-    out = [
-      {"title":e.title, "url":e.link, "seendate":today}
-      for e in feed.entries[:maxrec]
-    ]
+    out = [{"title":e.title, "url":e.link, "seendate":today}
+           for e in feed.entries[:maxrec]]
     _store(key, out)
     return out
 
-# ───────── BATCHED SIGNAL INFO (chunk=5) ─────────
-def gpt_batch_signal_info(headlines, chunk=5):
+# ───────── BATCHED SIGNAL INFO (chunk=10) ─────────
+def gpt_batch_signal_info(headlines, chunk=10):
     results=[]
     for i in range(0, len(headlines), chunk):
         batch = headlines[i:i+chunk]
@@ -173,11 +164,14 @@ def gpt_batch_signal_info(headlines, chunk=5):
         if rsp:
             try:
                 arr = json.loads(rsp.choices[0].message.content)
+                # coerce scores to floats up front
+                for item in arr:
+                    item["score"] = float(item.get("score",0) or 0)
                 results.extend(arr)
                 continue
             except:
                 pass
-        # fallback to individual
+        # fallback one-by-one
         for h in batch:
             tmp = gpt_signal_info(h)
             results.append({"headline":h, **tmp})
@@ -197,15 +191,14 @@ def gpt_signal_info(head):
     try:
         data = json.loads(rsp.choices[0].message.content)
         return {"company":data.get("company","Unknown"),
-                "score":float(data.get("score",0.0))}
+                "score":float(data.get("score",0) or 0)}
     except:
         return {"company":"Unknown","score":0.0}
 
-# ───────── SUMMARY switched to gpt-3.5-turbo & throttled ─────────
+# ───────── GPT SUMMARY (gpt-4o-mini + 10s throttle) ─────────
 def gpt_summary(co, heads):
     global _LAST_SUMMARY
-    # ensure ≥20s between calls
-    wait = 20 - (time.time() - _LAST_SUMMARY)
+    wait = SUMMARY_THROTTLE - (time.time() - _LAST_SUMMARY)
     if wait>0:
         time.sleep(wait)
     _LAST_SUMMARY = time.time()
@@ -226,7 +219,7 @@ def gpt_summary(co, heads):
     """).strip()
 
     rsp = safe_chat(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         messages=[{"role":"user","content":prompt}],
         temperature=0.2, max_tokens=220
     )
@@ -234,9 +227,11 @@ def gpt_summary(co, heads):
         return {"summary":heads[0][:120]+"…","sector":"unknown","confidence":0,"land_flag":0}
 
     try:
-        return json.loads(rsp.choices[0].message.content)
+        out = json.loads(rsp.choices[0].message.content)
+        out["confidence"] = float(out.get("confidence",0) or 0)
+        out["land_flag"]  = int(out.get("land_flag",0) or 0)
+        return out
     except:
-        # fallback to plain text summary
         return {"summary":rsp.choices[0].message.content,"sector":"unknown","confidence":0,"land_flag":0}
 
 # ───────── CONTACTS ─────────
@@ -262,10 +257,8 @@ def fetch_logo(co: str) -> bytes | None:
     dom = co.replace(" ","") + ".com"
     try:
         r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=6)
-        if r.ok:
-            return r.content
-    except:
-        pass
+        if r.ok: return r.content
+    except: pass
     return None
 
 def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
@@ -320,16 +313,17 @@ def fetch_permits():
         return []
     permits=[]
     with open(fpath, newline="", encoding="utf-8") as f:
-        reader=csv.DictReader(f)
+        reader = csv.DictReader(f)
         for row in reader:
             lat, lon = safe_geocode(row.get("address",""), row.get("company",""))
             permits.append({
-                "company": row.get("company",""),
-                "address": row.get("address",""),
-                "date":    row.get("date",""),
-                "type":    row.get("permit_type",""),
+                "company":     row.get("company",""),
+                "address":     row.get("address",""),
+                "date":        row.get("date",""),
+                "type":        row.get("permit_type",""),
                 "details_url": row.get("details_url",""),
-                "lat":     lat, "lon": lon
+                "lat":         lat,
+                "lon":         lon
             })
     return permits
 
@@ -355,10 +349,8 @@ def national_scan():
         for a in arts:
             if any(ek in a["title"].lower() for ek in EXTRA_KWS):
                 prospects.append({
-                    "headline": a["title"],
-                    "url":      a["url"],
-                    "date":     a["seendate"][:8],
-                    "src":      "scan"
+                    "headline":a["title"],"url":a["url"],
+                    "date":a["seendate"][:8],"src":"scan"
                 })
         bar.progress(i/len(SEED_KWS))
 
@@ -368,8 +360,9 @@ def national_scan():
     by_co = defaultdict(list)
     for p in prospects:
         for inf in infos:
+            # inf["score"] is guaranteed float above
             if inf["headline"]==p["headline"] and inf["score"]>=RELEVANCE_CUTOFF:
-                p["company"]=inf["company"]
+                p["company"] = inf["company"]
                 by_co[inf["company"]].append(p)
                 break
 
@@ -388,7 +381,7 @@ def national_scan():
         lat, lon = safe_geocode("", co)
         conn.execute(
             "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon)"
-            " VALUES(?,?,?,?,?,?)",
+            " VALUES(?,?,?,?,?,?,?)",
             (co, summ["summary"], json.dumps([summ["sector"]]),
              "New", lat, lon)
         )
