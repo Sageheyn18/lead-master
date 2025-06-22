@@ -1,10 +1,11 @@
-# app.py – Lead Master v5.8  (2025-06-22)
+# app.py – Lead Master v5.9  (2025-06-22)
 import os, json, datetime, pandas as pd, folium, streamlit as st
 from streamlit_folium import st_folium
 from PIL import Image
 
 from utils import get_conn, ensure_tables
 from fetch_signals import (
+    client,                     # ← IMPORT THE OPENAI CLIENT
     manual_search, national_scan, export_pdf,
     company_contacts, fetch_logo, gpt_summary,
     google_news, fetch_permits,
@@ -95,10 +96,9 @@ with st.sidebar:
     # search input
     st.header("Search company")
     co = st.text_input("", value=search_co, key="in")
-    if st.button("Go", key="go"):
-        if co.strip():
-            st.session_state["search_co"] = co.strip()
-            _rerun()
+    if st.button("Go", key="go") and co.strip():
+        st.session_state["search_co"] = co.strip()
+        _rerun()
 
     # back to map when overlay
     if search_co:
