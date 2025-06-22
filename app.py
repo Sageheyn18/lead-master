@@ -1,28 +1,30 @@
-# app.py  – Lead Master 5.0  (2025-06-20)
-# • Overlay: clean summary, confidence, sector tag, selectable headlines
+# app.py  – Lead Master 5.1
+# • Map / Companies pages
+# • Search overlay with bullet summary, sector/confidence, selectable headlines
 # • Manual sector dropdown on save
-# • Back-to-map button always visible
-# • Companies page: table selector → detail pane
-# • Duplicate insert guard
+# • Right-hand news panel with expanders + PDF export
+# • Back-to-map always visible while overlay active
+# • Duplicate-safe inserts
+# • Works on any Streamlit ≥ 1.26 (fallback _rerun helper)
 
 import json, datetime, pandas as pd, folium, streamlit as st
 from streamlit_folium import st_folium
-from utils import get_conn, ensure_tables
-from fetch_signals import (
-    manual_search, national_scan,
-    export_pdf, company_contacts, dedup,
-    BUDGET_USED, DAILY_BUDGET,
+
+from utils          import get_conn, ensure_tables
+from fetch_signals  import (
+    manual_search, national_scan, export_pdf, company_contacts,
+    BUDGET_USED, DAILY_BUDGET
 )
 
-# rerun helper (works on any Streamlit version)
+# ───────── universal rerun ─────────
 def _rerun():
     if hasattr(st, "rerun"):
         st.rerun()
-    else:
+    else:  # older Streamlit
         from streamlit.runtime.scriptrunner import RerunException, get_script_run_ctx
         raise RerunException(get_script_run_ctx())
 
-# ───────── THEME ─────────
+# ───────── theme / brand colours (Fisher Construction) ─────────
 GOLD = "#B7932F"; CHAR = "#41413F"
 st.set_page_config(page_title="Lead Master", layout="wide")
 st.markdown(
@@ -32,36 +34,44 @@ st.markdown(
     html, body, [class*="css"] {{font-family:'Inter',sans-serif}}
     .stButton>button {{background:{GOLD};color:#fff;border:none;
                        padding:6px 12px;border-radius:4px;font-weight:600}}
-    .news-dot {{height:10px;width:10px;background:{GOLD};border-radius:50%;
-                display:inline-block;margin-right:6px}}
+    .news-dot {{height:10px;width:10px;background:{GOLD};
+               border-radius:50%;display:inline-block;margin-right:6px}}
     </style>""",
     unsafe_allow_html=True,
 )
 
-# ───────── DB ─────────
+# ───────── DB connection ─────────
 conn = get_conn(); ensure_tables(conn)
 def load_clients(): return pd.read_sql("SELECT * FROM clients", conn)
 
-# ───────── left SIDEBAR ─────────
+# ───────── sidebar (always visible) ─────────
 with st.sidebar:
     st.header("Controls")
+
+    # national scan
     if st.button("Run national scan now"):
         with st.spinner("Scanning…"):
             national_scan()
         _rerun()
 
-    # Back-to-map always visible when overlay open
+    # back-to-map (only when overlay active)
     if "overlay" in st.session_state and st.button("Back to map"):
         st.session_state.pop("overlay"); _rerun()
 
-    PAGE = st.radio("Pages", ["Map", "Companies"])
+    # page selector
+    page_default = st.session_state.pop("page_override", None)
+    PAGE = st.radio("Pages", ["Map", "Companies"],
+                    index=0 if page_default != "Companies" else 1)
+
+    # manual search
     search_q = st.text_input("Search company")
     if search_q and st.button("Go"):
         st.session_state["overlay"] = search_q
 
+    # budget
     st.write(f"**GPT spend today:** {BUDGET_USED:.1f} ¢ / {DAILY_BUDGET} ¢")
 
-# ───────── layout 75 / 25 ─────────
+# layout: main + right-hand news panel
 left, right = st.columns([0.75, 0.25], gap="medium")
 
 # ───────── right-hand NEWS panel ─────────
@@ -80,7 +90,7 @@ with right:
         for _, r in news_df.iterrows():
             dot = "" if r.read_flag else "<span class='news-dot'></span>"
             header = f"{dot}{r.headline[:60]}…"
-            with st.expander(header, expanded=False):
+            with st.expander(header):
                 st.markdown(f"**{r.headline}**")
                 st.write(f"Date : {r.date}")
                 st.write(f"Source : {r.source_label}")
@@ -91,10 +101,11 @@ with right:
                 st.write("**Company summary**")
                 st.write(sum_by_co.get(r.company, '—'))
 
-                # export
+                # export PDF
                 if st.button("Export PDF", key=f"pdf{r.id}"):
                     pdf_bytes = export_pdf(
-                        r._asdict(), sum_by_co.get(r.company, ''),
+                        r._asdict(),
+                        sum_by_co.get(r.company, ''),
                         company_contacts(r.company))
                     st.download_button("Download PDF", pdf_bytes,
                         file_name=f"{r.company}_{r.date}.pdf",
@@ -103,61 +114,71 @@ with right:
                 # mark read
                 if not r.read_flag:
                     if st.button("Mark read", key=f"mark{r.id}"):
-                        conn.execute("UPDATE signals SET read_flag=1 WHERE id=?",
-                                     (int(r.id),)); conn.commit(); _rerun()
+                        conn.execute(
+                            "UPDATE signals SET read_flag=1 WHERE id=?", (int(r.id),))
+                        conn.commit(); _rerun()
 
 # ───────── SEARCH overlay helper ─────────
-def search_overlay(co: str):
-    info, raw_heads, lat, lon = manual_search(co)
-    # dedup row dicts
-    rows = dedup([{"title":t, "url":""} for t in raw_heads])
+def search_overlay(company: str):
+    info, rows, lat, lon = manual_search(company)  # rows already deduped!
 
-    left.markdown(f"## {co}")
-    bullets = info["summary"].split("•")
+    left.markdown(f"## {company}")
+
     left.write("**Executive summary**")
-    for b in bullets:
-        if b.strip(): left.write("• "+b.strip())
-    left.write(f"**Sector guess:** {info['sector']}  |  **Confidence:** {info['confidence']}")
-    left.divider()
+    for bullet in info["summary"].split("•"):
+        if bullet.strip():
+            left.write("• " + bullet.strip())
+    left.write(
+        f"**Sector guess:** {info['sector']} &nbsp;&nbsp; "
+        f"**Confidence:** {info['confidence']}")
 
-    left.write("### Headlines (select to save)")
+    left.divider(); left.write("### Headlines (tick to save)")
+
     save_flags = []
     for i, r in enumerate(rows):
-        with left.expander(r["title"][:80]):
-            st.markdown(f"[Open link]({r['url'] or 'https://news.google.com'})")
-            save_flags.append(st.checkbox("Save this headline", key=f"chk{i}"))
+        with left.expander(r["title"][:90]):
+            st.markdown(f"[Open article]({r['url'] or 'https://news.google.com'})")
+            save_flags.append(
+                st.checkbox("Save this headline", key=f"chk{i}"))
 
-    manual_sector = left.selectbox("Sector tag for this company",
-        ["Manufacturing","Food processing","Cold storage","Industrial","Retail",
-         "Logistics","Other"], index=0)
+    manual_sector = left.selectbox(
+        "Sector tag", ["Manufacturing","Food processing","Cold storage",
+                       "Industrial","Retail","Logistics","Other"], index=0)
 
     if left.button("Save selected"):
+        saved_any = False
         for i, keep in enumerate(save_flags):
-            if keep:
-                row = rows[i]
-                # prevent exact duplicate insert
-                dupe = conn.execute(
-                    "SELECT 1 FROM signals WHERE headline=? LIMIT 1",
-                    (row["title"],)).fetchone()
-                if dupe: continue
-                conn.execute(
-                    "INSERT INTO signals (company,date,headline,url,source_label,"
-                    " land_flag,sector_guess,lat,lon) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (co, datetime.date.today().strftime("%Y%m%d"), row["title"],
-                     row["url"], "search", info["land_flag"], manual_sector,
-                     lat, lon))
-        conn.execute(
-            "INSERT OR REPLACE INTO clients (name,summary,sector_tags,status)"
-            " VALUES (?,?,?, 'New')",
-            (co, info["summary"], json.dumps([manual_sector])))
-        conn.commit(); left.success("Saved.")
-        left.button("Go to Companies", on_click=lambda: st.session_state.update(
-            overlay=None, page_override="Companies"))
+            if not keep: continue
+            row = rows[i]
+            dup = conn.execute(
+                "SELECT 1 FROM signals WHERE headline=? LIMIT 1",
+                (row["title"],)).fetchone()
+            if dup: continue
+            conn.execute(
+                "INSERT INTO signals (company,date,headline,url,source_label,"
+                " land_flag,sector_guess,lat,lon) VALUES (?,?,?,?,?,?,?,?,?)",
+                (company, datetime.date.today().strftime("%Y%m%d"),
+                 row["title"], row["url"], "search",
+                 info["land_flag"], manual_sector, lat, lon))
+            saved_any = True
+
+        if saved_any:
+            conn.execute(
+                "INSERT OR REPLACE INTO clients (name,summary,sector_tags,status)"
+                " VALUES (?,?,?, 'New')",
+                (company, info["summary"], json.dumps([manual_sector])))
+            conn.commit()
+            left.success("Saved.")
+            st.session_state.pop("overlay")
+            st.session_state["page_override"] = "Companies"
+            _rerun()
+        else:
+            left.warning("No headlines ticked.")
 
     if left.button("Close"):
         st.session_state.pop("overlay"); _rerun()
 
-# ───────── main PAGES ─────────
+# ───────── MAIN AREA ─────────
 if "overlay" in st.session_state:
     search_overlay(st.session_state["overlay"])
 
@@ -165,12 +186,13 @@ elif PAGE == "Map":
     left.title("Lead Master — Project Map")
 
     clients = load_clients()
-    sector = st.sidebar.multiselect(
+    sector_filter = st.sidebar.multiselect(
         "Sector tag", sorted({t for tags in clients.sector_tags.apply(json.loads)
                               for t in tags}))
+
     today = datetime.date.today()
     start = st.sidebar.date_input("Start", today - datetime.timedelta(days=150))
-    end   = st.sidebar.date_input("End", today)
+    end   = st.sidebar.date_input("End",   today)
 
     sig = pd.read_sql(
         "SELECT company, MAX(date) AS date, lat, lon "
@@ -178,47 +200,43 @@ elif PAGE == "Map":
         conn, params=(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
     )
     df = clients.merge(sig, left_on="name", right_on="company", how="inner")
-    if sector:
+    if sector_filter:
         df = df[df.sector_tags.apply(
-            lambda s: any(t in json.loads(s) for t in sector))]
+            lambda s: any(t in json.loads(s) for t in sector_filter))]
 
-    m = folium.Map(location=[37, -96], zoom_start=4, tiles="CartoDB Positron")
+    fmap = folium.Map(location=[37, -96], zoom_start=4, tiles="CartoDB Positron")
     for _, r in df.iterrows():
         if pd.notna(r.lat) and pd.notna(r.lon):
             folium.Marker(
                 [r.lat, r.lon],
                 popup=f"<b>{r.name}</b><br>{r.summary}",
                 icon=folium.Icon(color="orange", icon="info-sign")
-            ).add_to(m)
-    st_folium(m, height=600, width="100%")
+            ).add_to(fmap)
+    st_folium(fmap, height=600, width="100%")
 
-else:  # COMPANIES
+else:  # Companies page
     left.title("Companies")
     clients = load_clients()
     if clients.empty:
         left.info("No companies saved yet.")
     else:
-        # left pane selector
-        sel_col, detail_col = left.columns([0.35, 0.65], gap="medium")
-        sel_table = clients[["name","status"]].rename(
+        sel_col, info_col = left.columns([0.35, 0.65], gap="medium")
+        table = clients[["name","status"]].rename(
             columns={"name":"Company","status":"Status"})
-        sel_col.dataframe(sel_table, height=520, use_container_width=True)
-        selected = sel_col.selectbox("Select company", clients.name.tolist())
-        row = clients.set_index("name").loc[selected]
+        sel_col.dataframe(table, height=520, use_container_width=True)
+        selection = sel_col.selectbox("Select company", clients.name.tolist())
+        row = clients.set_index("name").loc[selection]
 
-        # right pane details
-        detail_col.subheader(selected)
-        detail_col.write(f"**Status:** {row.status}")
-        detail_col.write(row.summary or "—")
-        detail_col.write("**Sector tags:** "+
-            ", ".join(json.loads(row.sector_tags)))
-        # signals table
+        info_col.subheader(selection)
+        info_col.write(f"**Status:** {row.status}")
+        info_col.write(row.summary or "—")
+        info_col.write("**Sector tags:** "+", ".join(json.loads(row.sector_tags)))
+
         sigs = pd.read_sql(
             "SELECT date, headline, url FROM signals WHERE company=? "
-            "ORDER BY date DESC LIMIT 20",
-            conn, params=(selected,))
+            "ORDER BY date DESC LIMIT 20", conn, params=(selection,))
         if not sigs.empty:
-            detail_col.write("**Latest signals**")
+            info_col.write("**Latest signals**")
             for _, s in sigs.iterrows():
-                detail_col.markdown(
-                    f"- {s.date} – [{s.headline[:90]}…]({s.url or '#'})")
+                info_col.markdown(
+                    f"- {s.date} – [{s.headline[:90]}]({s.url or '#'})")
