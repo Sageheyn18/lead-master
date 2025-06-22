@@ -1,4 +1,4 @@
-# fetch_signals.py  – Lead Master  v6.6   (2025-06-23)
+# fetch_signals.py  – Lead Master  v6.7   (2025-06-23)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3, csv
 from collections import defaultdict
@@ -164,7 +164,6 @@ def gpt_batch_signal_info(headlines, chunk=10):
             try:
                 arr = json.loads(rsp.choices[0].message.content)
                 for item in arr:
-                    # coerce score to float
                     item["score"] = float(item.get("score",0) or 0)
                 results.extend(arr)
                 continue
@@ -354,12 +353,12 @@ def national_scan():
         bar.progress(i/len(SEED_KWS))
 
     prospects = dedup(prospects)
-    infos = gpt_batch_signal_info([p["headline"] for p in prospects])
+    infos     = gpt_batch_signal_info([p["headline"] for p in prospects])
 
     by_co = defaultdict(list)
     for p in prospects:
         for inf in infos:
-            # safely cast score before comparison
+            # ensure score is float
             try:
                 sc = float(inf.get("score",0) or 0)
             except:
@@ -371,8 +370,14 @@ def national_scan():
 
     rows=[]
     for co, items in by_co.items():
-        heads    = [it["headline"] for it in items]
-        summ     = gpt_summary(co, heads)
+        heads = [it["headline"] for it in items]
+        info  = gpt_summary(co, heads)
+
+        # ─── normalize any list‐typed summary into a single string
+        raw = info.get("summary","")
+        if isinstance(raw, list):
+            info["summary"] = "\n".join(raw)
+
         contacts = company_contacts(co)
         for c in contacts:
             conn.execute(
@@ -381,19 +386,28 @@ def national_scan():
                 (co,c.get("name",""),c.get("title",""),
                  c.get("email",""),c.get("phone",""))
             )
+
         lat, lon = safe_geocode("", co)
         conn.execute(
-            "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon)"
-            " VALUES(?,?,?,?,?,?)",
-            (co, summ["summary"], json.dumps([summ["sector"]]),
-             "New", lat, lon)
+            "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                co,
+                info["summary"],
+                json.dumps([info["sector"]]),
+                "New",
+                lat,
+                lon
+            )
         )
+
         for it in items:
             it.update({
-                "land_flag":  summ["land_flag"],
-                "sector":     summ["sector"],
-                "confidence": summ["confidence"],
-                "lat":        lat, "lon": lon
+                "land_flag":  info["land_flag"],
+                "sector":     info["sector"],
+                "confidence": info["confidence"],
+                "lat":        lat,
+                "lon":        lon
             })
             rows.append(it)
 
