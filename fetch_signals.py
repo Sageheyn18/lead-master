@@ -1,12 +1,15 @@
-# fetch_signals.py  – Lead Master  v6.1   (2025-06-22)
+# fetch_signals.py  – Lead Master  v6.2   (2025-06-22)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3
 from collections import defaultdict
 from urllib.parse     import quote_plus
 
-import feedparser, streamlit as st
+import feedparser
+import streamlit as st
 from geopy.geocoders  import Nominatim
 from openai           import OpenAI, RateLimitError
+from fpdf             import FPDF
+import magic
 
 from utils import get_conn, ensure_tables
 
@@ -91,7 +94,7 @@ def _geo(q):
 
 def safe_geocode(head, co):
     lat,lon = _geo(head)
-    if lat is None:
+    if lat is None or lon is None:
         lat,lon = _geo(f"{co} headquarters")
     return lat,lon
 
@@ -102,20 +105,23 @@ def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
     if cached is not None:
         return cached
 
-    url = "https://newsapi.org/v2/everything"
+    url    = "https://newsapi.org/v2/everything"
     params = {
         "apiKey": NEWSAPI_KEY,
-        "q": query,
+        "q":      query,
         "pageSize": maxrec,
-        "sortBy": "publishedAt",
+        "sortBy":   "publishedAt",
         "language": "en"
     }
     try:
         resp = requests.get(url, params=params, timeout=15).json()
         arts = resp.get("articles", [])
         out  = [
-            {"title": a.get("title",""), "url": a.get("url",""),
-             "seendate": a.get("publishedAt","")[:10].replace("-","")}
+            {
+              "title":    a.get("title",""),
+              "url":      a.get("url",""),
+              "seendate": a.get("publishedAt","")[:10].replace("-","")
+            }
             for a in arts
         ]
     except Exception as e:
@@ -136,16 +142,17 @@ def google_news(co, maxrec=MAX_HEADLINES):
            f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en")
     feed = feedparser.parse(url)
     today= datetime.datetime.utcnow().strftime("%Y%m%d")
-    out = [{"title":e.title, "url":e.link, "seendate":today}
-           for e in feed.entries[:maxrec]]
-
+    out = [
+      {"title":e.title, "url":e.link, "seendate":today}
+      for e in feed.entries[:maxrec]
+    ]
     _store(key, out)
     return out
 
 # ───────── BATCHED SIGNAL INFO ─────────
 def gpt_batch_signal_info(headlines, chunk=10):
     results=[]
-    for i in range(0,len(headlines),chunk):
+    for i in range(0, len(headlines), chunk):
         batch = headlines[i:i+chunk]
         prompt = "For each headline return JSON array of {headline,company,score}:\n"
         for h in batch:
@@ -162,21 +169,23 @@ def gpt_batch_signal_info(headlines, chunk=10):
                 continue
             except:
                 pass
-        # fallback to per-headline
+        # fallback to individual calls
         for h in batch:
             tmp = gpt_signal_info(h)
             results.append({"headline":h, **tmp})
     return results
 
 def gpt_signal_info(head):
-    if not budget_ok(0.07): return {"company":"Unknown","score":0.0}
+    if not budget_ok(0.07):
+        return {"company":"Unknown","score":0.0}
     prompt = f'Return EXACT JSON {{"company":<name>,"score":<0-1>}} for:\n"{head}"'
     rsp = safe_chat(
         model="gpt-3.5-turbo",
         messages=[{"role":"user","content":prompt}],
         temperature=0, max_tokens=32
     )
-    if not rsp: return {"company":"Unknown","score":0.0}
+    if not rsp:
+        return {"company":"Unknown","score":0.0}
     try:
         data = json.loads(rsp.choices[0].message.content)
         return {"company":data.get("company","Unknown"),
@@ -189,9 +198,10 @@ def gpt_summary(co, heads):
     global _4O_LAST_CALL
     if not heads:
         return {"summary":"No signals","sector":"unknown","confidence":0,"land_flag":0}
-    wait = 21 - (time.time()-_4O_LAST_CALL)
-    if wait>0: time.sleep(wait)
-    cost=0.5
+    wait = 21 - (time.time() - _4O_LAST_CALL)
+    if wait>0:
+        time.sleep(wait)
+    cost = 0.5
     if not budget_ok(cost):
         return {"summary":heads[0][:120]+"…","sector":"unknown","confidence":0,"land_flag":0}
     prompt = textwrap.dedent(f"""
@@ -225,21 +235,76 @@ def company_contacts(co):
         messages=[{"role":"user","content":prompt}],
         temperature=0, max_tokens=256
     )
-    if not rsp: return []
+    if not rsp:
+        return []
     try:
         return json.loads(rsp.choices[0].message.content)
     except:
         return []
 
+# ───────── LOGO & PDF ─────────
+def fetch_logo(co: str) -> bytes | None:
+    dom = co.replace(" ","") + ".com"
+    try:
+        r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=6)
+        if r.ok:
+            return r.content
+    except:
+        pass
+    return None
+
+def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
+    pdf = FPDF(); pdf.set_auto_page_break(True,15); pdf.add_page()
+    pdf.set_font("Helvetica","B",16)
+    logo = fetch_logo(row["company"])
+    if logo:
+        ext = magic.from_buffer(logo, mime=True).split("/")[-1]
+        fn  = f"/tmp/logo.{ext}"
+        open(fn,"wb").write(logo)
+        pdf.image(fn, x=10, y=10, w=20); pdf.set_xy(35,10)
+    txt = row.get("headline", row.get("title",""))
+    pdf.multi_cell(0,10, txt); pdf.ln(5)
+    pdf.set_font("Helvetica","",12)
+    for b in bullets.split("•"):
+        if b.strip():
+            pdf.multi_cell(0,7,"• "+b.strip())
+    pdf.ln(3)
+    if contacts:
+        pdf.set_font("Helvetica","B",13); pdf.cell(0,8,"Key Contacts",ln=1)
+        pdf.set_font("Helvetica","",11)
+        for c in contacts:
+            pdf.multi_cell(0,6,
+                f"{c.get('name','')} — {c.get('title','')}\n"
+                f"{c.get('email','')}  {c.get('phone','')}"
+            ); pdf.ln(1)
+    pdf.set_y(-30); pdf.set_font("Helvetica","I",9)
+    pdf.multi_cell(0,5,
+        f"Source: {row.get('url','')}\nGenerated: {datetime.datetime.now():%Y-%m-%d %H:%M}"
+    )
+    return pdf.output(dest="S").encode("latin-1")
+
+# ───────── MANUAL SEARCH FOR UI ─────────
+def manual_search(company: str):
+    arts = gdelt_headlines(company, MAX_HEADLINES)
+    if not arts:
+        arts = google_news(company, MAX_HEADLINES)
+    arts = [a for a in arts if any(ek in a["title"].lower() for ek in EXTRA_KWS)]
+    arts = dedup(arts)
+    heads = [a["title"] for a in arts][:MAX_HEADLINES]
+    if not heads:
+        return None, [], None, None
+    info = gpt_summary(company, heads)
+    lat, lon = safe_geocode("", company)
+    return info, heads, lat, lon
+
 # ───────── DB WRITERS ─────────
-def write_signals(rows, conn):
+def write_signals(rows: list[dict], conn):
     for r in rows:
         conn.execute(
             "INSERT INTO signals(company,date,headline,url,source_label,"
             "land_flag,sector_guess,lat,lon) VALUES(?,?,?,?,?,?,?,?,?)",
-            (r["company"], r["date"], r["headline"], r["url"],
-             r["src"], r["land_flag"], r["sector"],
-             r["lat"], r["lon"])
+            (r["company"],r["date"],r["headline"],r["url"],
+             r["src"],r["land_flag"],r["sector"],r["lat"],r["lon"])
         )
     conn.commit()
 
@@ -267,8 +332,8 @@ def national_scan():
     by_co = defaultdict(list)
     for p in prospects:
         for inf in infos:
-            if inf["headline"] == p["headline"] and inf["score"] >= RELEVANCE_CUTOFF:
-                p["company"] = inf["company"]
+            if inf["headline"]==p["headline"] and inf["score"]>=RELEVANCE_CUTOFF:
+                p["company"]=inf["company"]
                 by_co[inf["company"]].append(p)
                 break
 
@@ -277,7 +342,6 @@ def national_scan():
         heads = [it["headline"] for it in items]
         summ  = gpt_summary(co, heads)
         contacts = company_contacts(co)
-        # persist contacts
         for c in contacts:
             conn.execute(
                 "INSERT OR IGNORE INTO contacts(company,name,title,email,phone)"
@@ -285,7 +349,6 @@ def national_scan():
                 (co,c.get("name",""),c.get("title",""),
                  c.get("email",""),c.get("phone",""))
             )
-        # geocode HQ once
         lat, lon = safe_geocode("", co)
         conn.execute(
             "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon)"
