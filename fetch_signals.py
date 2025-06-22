@@ -1,8 +1,9 @@
-# fetch_signals.py  – Lead Master  v6.7   (2025-06-23)
+# fetch_signals.py  – Lead Master  v6.8   (2025-06-23)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3, csv
 from collections import defaultdict
 from urllib.parse     import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import feedparser, streamlit as st
 from geopy.geocoders  import Nominatim
@@ -102,7 +103,7 @@ def safe_geocode(head, co):
         lat, lon = _geo(f"{co} headquarters")
     return lat, lon
 
-# ───────── NEWSAPI VIA REQUESTS ─────────
+# ───────── NEWSAPI VIA REQUESTS (5s timeout) ─────────
 def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
     key = f"newsapi:{query}:{maxrec}"
     cached = _cached(key)
@@ -118,10 +119,11 @@ def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
         "language": "en"
     }
     try:
-        resp = requests.get(url, params=params, timeout=15).json()
+        resp = requests.get(url, params=params, timeout=5).json()
         arts = resp.get("articles", [])
         out  = [
-            {"title":a.get("title",""), "url":a.get("url",""), "seendate":a.get("publishedAt","")[:10].replace("-","")}
+            {"title":a.get("title",""), "url":a.get("url",""),
+             "seendate":a.get("publishedAt","")[:10].replace("-","")}
             for a in arts
         ]
     except Exception as e:
@@ -130,7 +132,7 @@ def gdelt_headlines(query, maxrec=MAX_PROSPECTS):
     _store(key, out)
     return out
 
-# ───────── RSS FETCH ─────────
+# ───────── RSS FETCH (5s timeout) ─────────
 def google_news(co, maxrec=MAX_HEADLINES):
     key = f"rss:{co}:{maxrec}"
     cached = _cached(key)
@@ -140,10 +142,14 @@ def google_news(co, maxrec=MAX_HEADLINES):
     q   = f'"{co}" ({" OR ".join(EXTRA_KWS)})'
     url = ("https://news.google.com/rss/search?"
            f"q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en")
-    feed = feedparser.parse(url)
-    today= datetime.datetime.utcnow().strftime("%Y%m%d")
-    out = [{"title":e.title, "url":e.link, "seendate":today}
-           for e in feed.entries[:maxrec]]
+    try:
+        feed = feedparser.parse(url, request_timeout=5)
+        today= datetime.datetime.utcnow().strftime("%Y%m%d")
+        out = [{"title":e.title, "url":e.link, "seendate":today}
+               for e in feed.entries[:maxrec]]
+    except Exception as e:
+        logging.warning(f"RSS fetch failed ({e}); returning empty")
+        out = []
     _store(key, out)
     return out
 
@@ -253,7 +259,7 @@ def company_contacts(co):
 def fetch_logo(co: str) -> bytes | None:
     dom = co.replace(" ","") + ".com"
     try:
-        r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=6)
+        r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=5)
         if r.ok: return r.content
     except:
         pass
@@ -338,19 +344,25 @@ def write_signals(rows: list[dict], conn):
 
 def national_scan():
     conn = get_conn(); ensure_tables(conn)
-    prospects=[]; bar=st.progress(0.0)
+    prospects=[]
 
-    for i, kw in enumerate(SEED_KWS, start=1):
-        arts = gdelt_headlines(kw, MAX_PROSPECTS)
-        if not arts:
-            arts = google_news(kw, MAX_PROSPECTS)
-        for a in arts:
-            if any(ek in a["title"].lower() for ek in EXTRA_KWS):
-                prospects.append({
-                    "headline":a["title"],"url":a["url"],
-                    "date":a["seendate"][:8],"src":"scan"
-                })
-        bar.progress(i/len(SEED_KWS))
+    # ─── fetch all seeds in parallel ───
+    bar = st.progress(0.0)
+    futures = {}
+    with ThreadPoolExecutor(max_workers=len(SEED_KWS)) as pool:
+        for kw in SEED_KWS:
+            futures[pool.submit(
+                lambda k=kw: [
+                    {"headline":a["title"],"url":a["url"],"date":a["seendate"][:8],"src":"scan"}
+                    for a in (gdelt_headlines(k, MAX_PROSPECTS) or google_news(k, MAX_PROSPECTS))
+                    if any(ek in a["title"].lower() for ek in EXTRA_KWS)
+                ], kw
+            )] = kw
+
+        for i, fut in enumerate(as_completed(futures), start=1):
+            prospects.extend(fut.result())
+            bar.progress(i/len(SEED_KWS))
+    bar.empty()
 
     prospects = dedup(prospects)
     infos     = gpt_batch_signal_info([p["headline"] for p in prospects])
@@ -358,7 +370,6 @@ def national_scan():
     by_co = defaultdict(list)
     for p in prospects:
         for inf in infos:
-            # ensure score is float
             try:
                 sc = float(inf.get("score",0) or 0)
             except:
@@ -373,7 +384,6 @@ def national_scan():
         heads = [it["headline"] for it in items]
         info  = gpt_summary(co, heads)
 
-        # ─── normalize any list‐typed summary into a single string
         raw = info.get("summary","")
         if isinstance(raw, list):
             info["summary"] = "\n".join(raw)
@@ -412,5 +422,4 @@ def national_scan():
             rows.append(it)
 
     write_signals(rows, conn)
-    bar.progress(1.0); bar.empty()
     logging.info(f"Wrote {len(rows)} signals")
