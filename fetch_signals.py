@@ -1,11 +1,9 @@
 """
-fetch_signals.py  – Lead Master  v5.0   (2025-06-21)
+fetch_signals.py  – Lead Master  v5.1   (2025-06-22)
 
-Speed-ups:
- • Google-News RSS (≤20 items) with 24 h SQLite cache
- • Batch GPT-3.5 per headline → company + relevance
- • Single GPT-4o-mini summary per company
- • HQ-fallback geocode, Clearbit logos, contacts table, PDF export
+• Fail-fast on OpenAI rate limits (no 21 s back-offs)
+• Manual-search uses only relevance (not company-guess) to include headlines
+• All other v5.0 behavior (RSS cache, batch GPT-3.5, single GPT-4o summary, etc.)
 """
 
 import os, json, time, datetime, logging, textwrap, requests, feedparser, sqlite3
@@ -43,7 +41,7 @@ EXTRA_KWS = [
     "facility","plant","warehouse","distribution center"
 ]
 
-# ───────── SQLite RSS cache ─────────
+# ───────── SQLITE RSS CACHE ─────────
 _cache = get_conn()
 _cache.execute("""
 CREATE TABLE IF NOT EXISTS rss_cache(
@@ -62,13 +60,14 @@ def budget_ok(cost: float) -> bool:
     BUDGET_USED += cost; return True
 
 def safe_chat(**params):
-    for i in range(3):
-        try:    return client.chat.completions.create(**params)
-        except RateLimitError:
-            logging.warning("Rate limit; retry in 21 s (%s/3)", i+1)
-            time.sleep(21)
-    logging.error("Rate-limit after retries.")
-    return None
+    """
+    Fail-fast on rate limits. Return None immediately if over limit.
+    """
+    try:
+        return client.chat.completions.create(**params)
+    except RateLimitError:
+        logging.warning("OpenAI rate-limit – skipping call")
+        return None
 
 def keyword_filter(title: str, co: str | None=None) -> bool:
     low = title.lower()
@@ -92,7 +91,7 @@ def safe_geocode(head: str, co: str):
     lat, lon = _geo(head)
     return (lat, lon) if lat is not None else _geo(co)
 
-# ───────── RSS FETCH (cached) ─────────
+# ───────── RSS FETCH (CACHED) ─────────
 def google_news(co: str, max_rec: int=MAX_HEADLINES) -> list[dict]:
     now = int(time.time())
     query = f'"{co}" ({" OR ".join(EXTRA_KWS)})'
@@ -109,7 +108,7 @@ def google_news(co: str, max_rec: int=MAX_HEADLINES) -> list[dict]:
         feed = feedparser.parse(url)
         today = datetime.datetime.utcnow().strftime("%Y%m%d")
         items = [
-            {"title":e.title, "url":e.link, "seendate":today}
+            {"title":e.title,"url":e.link,"seendate":today}
             for e in feed.entries[:max_rec]
         ]
         _cache.execute(
@@ -124,8 +123,7 @@ def gpt_signal_info(head: str) -> dict:
     if not budget_ok(0.07):
         return {"company":"Unknown","score":0.0}
     prompt = textwrap.dedent(f"""
-        Return EXACTLY a JSON object {{ "company":<name>,"score":<0-1> }}
-        for the headline below (land purchase or new construction signal):
+        Return EXACTLY {{ "company":<name>,"score":<0-1> }} for:
         "{head}"
     """)
     rsp = safe_chat(
@@ -133,7 +131,8 @@ def gpt_signal_info(head: str) -> dict:
         messages=[{"role":"user","content":prompt}],
         temperature=0, max_tokens=32
     )
-    if not rsp: return {"company":"Unknown","score":0.0}
+    if not rsp:
+        return {"company":"Unknown","score":0.0}
     try:
         data = json.loads(rsp.choices[0].message.content.strip())
         return {"company":data.get("company","Unknown"),
@@ -154,8 +153,8 @@ def gpt_summary(co: str, heads: list[str]) -> dict:
                 "confidence":0,"land_flag":0}
 
     prompt = textwrap.dedent(f"""
-        Summarise in ≤6 bullet points. Guess sector.
-        land_flag=1 if land/site purchase implied.
+        Summarise ≤6 bullets. Guess sector.
+        land_flag=1 if site purchase.
         Return EXACT JSON {{summary, sector, confidence, land_flag}}.
         Headlines:
         {"".join("- "+h+"\\n" for h in heads[:10])}
@@ -179,10 +178,8 @@ def gpt_summary(co: str, heads: list[str]) -> dict:
 def write_signals(rows: list[dict], conn):
     for r in rows:
         conn.execute(
-            "INSERT INTO signals"
-            "(company,date,headline,url,source_label,land_flag,"
-            " sector_guess,lat,lon)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO signals(company,date,headline,url,source_label,"
+            "land_flag,sector_guess,lat,lon) VALUES(?,?,?,?,?,?,?,?,?)",
             (r["company"],r["date"],r["headline"],r["url"],r["src"],
              r["land_flag"],r["sector"],r["lat"],r["lon"])
         )
@@ -198,7 +195,7 @@ def write_contacts(co: str, people: list[dict], conn):
         )
     conn.commit()
 
-# ensure contacts table exists
+# ensure contacts table
 _conn = get_conn()
 _conn.execute("""
 CREATE TABLE IF NOT EXISTS contacts(
@@ -210,7 +207,7 @@ _conn.commit()
 # ───────── CONTACTS VIA GPT-3.5 ─────────
 def company_contacts(co: str) -> list[dict]:
     if not budget_ok(0.4): return []
-    prompt = (f"Return a JSON array (≤3) of procurement/engineering/"
+    prompt = (f"Return JSON array (≤3) of procurement/engineering/"
               f"construction contacts for {co}. Fields:name,title,email,phone.")
     rsp = safe_chat(
         model="gpt-3.5-turbo",
@@ -218,15 +215,13 @@ def company_contacts(co: str) -> list[dict]:
         temperature=0, max_tokens=256
     )
     if not rsp: return []
-    try:
-        return json.loads(rsp.choices[0].message.content.strip())
-    except:
-        return []
+    try: return json.loads(rsp.choices[0].message.content.strip())
+    except: return []
 
-# ───────── LOGO (Clearbit) ─────────
+# ───────── CLEARBIT LOGO ─────────
 @st.cache_data(show_spinner=False)
 def fetch_logo(co: str) -> bytes | None:
-    dom = co.replace(" ","") + ".com"
+    dom = co.replace(" ","")+".com"
     try:
         r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=6)
         return r.content if r.ok else None
@@ -237,19 +232,16 @@ def fetch_logo(co: str) -> bytes | None:
 def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
     pdf = FPDF(); pdf.set_auto_page_break(True,15); pdf.add_page()
     pdf.set_font("Helvetica","B",16)
-
     logo = fetch_logo(row["company"])
     if logo:
-        ext = magic.from_buffer(logo, mime=True).split("/")[-1]
-        fn  = f"/tmp/l.{ext}"; open(fn,"wb").write(logo)
+        ext = magic.from_buffer(logo,mime=True).split("/")[-1]
+        fn  = f"/tmp/logo.{ext}"; open(fn,"wb").write(logo)
         pdf.image(fn,x=10,y=10,w=20); pdf.set_xy(35,10)
-
     pdf.multi_cell(0,10,row["headline"]); pdf.ln(5)
     pdf.set_font("Helvetica","",12)
     for b in bullets.split("•"):
         if b.strip(): pdf.multi_cell(0,7,"• "+b.strip())
     pdf.ln(3)
-
     if contacts:
         pdf.set_font("Helvetica","B",13); pdf.cell(0,8,"Key Contacts",ln=1)
         pdf.set_font("Helvetica","",11)
@@ -259,11 +251,10 @@ def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
                 f"{c.get('name','')} — {c.get('title','')}\n"
                 f"{c.get('email','')}  {c.get('phone','')}"
             ); pdf.ln(1)
-
     pdf.set_y(-30); pdf.set_font("Helvetica","I",9)
     pdf.multi_cell(
         0,5,
-        f"Source: {row['url']}\nGenerated: {datetime.datetime.now():%Y-%m-%d %H:%M}"
+        f"Source: {row['url']}\nGenerated:{datetime.datetime.now():%Y-%m-%d %H:%M}"
     )
     return pdf.output(dest="S").encode("latin-1")
 
@@ -272,56 +263,52 @@ def national_scan():
     conn = get_conn(); ensure_tables(conn)
     prospects=[]; bar=st.progress(0.0)
 
-    # 1) fetch & filter
+    # fetch & filter
     for i,kw in enumerate(SEED_KWS[:10],1):
         for a in google_news("", MAX_PROSPECTS):
             if keyword_filter(a["title"]):
                 prospects.append({
-                    "headline":a["title"],
-                    "url":      a["url"],
-                    "date":     a["seendate"][:8],
-                    "src":      "scan"
+                    "headline":a["title"],"url":a["url"],
+                    "date":a["seendate"][:8],"src":"scan"
                 })
         bar.progress(i/len(SEED_KWS))
 
     prospects = dedup(prospects)
 
-    # 2) GPT-3.5 batch per headline
+    # batch GPT per headline
     scored=[]
-    for j,pr in enumerate(prospects,1):
-        info = gpt_signal_info(pr["headline"])
-        if info["score"] >= RELEVANCE_CUTOFF:
-            pr["company"] = info["company"]; scored.append(pr)
+    for j,p in enumerate(prospects,1):
+        inf = gpt_signal_info(p["headline"])
+        if inf["score"] >= RELEVANCE_CUTOFF:
+            p["company"] = inf["company"]; scored.append(p)
         bar.progress(0.5 + 0.5*j/len(prospects))
 
-    # 3) group & summarize
-    by_co = defaultdict(list)
-    for pr in scored:
-        by_co[pr["company"]].append(pr)
+    # group & summarize
+    by_co=defaultdict(list)
+    for p in scored: by_co[p["company"]].append(p)
 
     rows=[]
     for co, items in by_co.items():
         heads    = [it["headline"] for it in items]
-        summary  = gpt_summary(co, heads)
+        summ     = gpt_summary(co, heads)
         contacts = company_contacts(co)
         write_contacts(co, contacts, conn)
 
         for it in items:
             lat, lon = safe_geocode(it["headline"], co)
             it.update(
-                land_flag  = summary["land_flag"],
-                sector     = summary["sector"],
-                confidence = summary["confidence"],
+                land_flag  = summ["land_flag"],
+                sector     = summ["sector"],
+                confidence = summ["confidence"],
                 lat        = lat,
                 lon        = lon
             )
             rows.append(it)
 
         conn.execute(
-            "INSERT OR REPLACE INTO clients"
-            "(name,summary,sector_tags,status)"
+            "INSERT OR REPLACE INTO clients (name,summary,sector_tags,status)"
             " VALUES(?,?,?, 'New')",
-            (co, summary["summary"], json.dumps([summary["sector"]]))
+            (co, summ["summary"], json.dumps([summ["sector"]]))
         )
 
     write_signals(rows, conn)
@@ -329,26 +316,24 @@ def national_scan():
     logging.info("national_scan wrote %s signals", len(rows))
 
 # ───────── MANUAL SEARCH ─────────
-def manual_search(company: str):
+def manual_search(co: str):
     conn = get_conn()
-    # 1) RSS + filter
-    arts = google_news(company, MAX_HEADLINES)
+    arts = google_news(co, MAX_HEADLINES)
     rows = [
         {"title":a["title"],"url":a["url"],"date":a["seendate"][:8],"src":"search"}
-        for a in arts if keyword_filter(a["title"], company)
+        for a in arts if keyword_filter(a["title"], co)
     ]
     rows = dedup(rows)
 
-    # 2) GPT-3.5 batch per headline
+    # batch GPT per headline (no company match filter)
     scored=[]
     for r in rows:
-        info = gpt_signal_info(r["title"])
-        if info["company"].lower()==company.lower() and info["score"]>=RELEVANCE_CUTOFF:
-            r["company"] = info["company"]; scored.append(r)
+        inf = gpt_signal_info(r["title"])
+        if inf["score"] >= RELEVANCE_CUTOFF:
+            r["company"] = co; scored.append(r)
 
-    # 3) summary + geo
     heads   = [r["title"] for r in scored]
-    summary = gpt_summary(company, heads)
-    lat, lon = safe_geocode(summary["summary"], company)
+    summ    = gpt_summary(co, heads)
+    lat,lon = safe_geocode(summ["summary"], co)
 
-    return summary, scored, lat, lon
+    return summ, scored, lat, lon
