@@ -1,4 +1,4 @@
-# fetch_signals.py  – Lead Master  v6.5   (2025-06-23)
+# fetch_signals.py  – Lead Master  v6.6   (2025-06-23)
 
 import os, json, time, datetime, logging, textwrap, requests, sqlite3, csv
 from collections import defaultdict
@@ -23,8 +23,7 @@ MAX_PROSPECTS    = 100
 MAX_HEADLINES    = 20
 DAILY_BUDGET     = int(os.getenv("DAILY_BUDGET_CENTS","300"))
 BUDGET_USED      = 0
-# throttle between GPT-4 calls (seconds)
-SUMMARY_THROTTLE = 10
+SUMMARY_THROTTLE = 10    # seconds between GPT calls
 _LAST_SUMMARY    = 0
 RELEVANCE_CUTOFF = 0.45
 
@@ -164,14 +163,13 @@ def gpt_batch_signal_info(headlines, chunk=10):
         if rsp:
             try:
                 arr = json.loads(rsp.choices[0].message.content)
-                # coerce scores to floats up front
                 for item in arr:
+                    # coerce score to float
                     item["score"] = float(item.get("score",0) or 0)
                 results.extend(arr)
                 continue
             except:
                 pass
-        # fallback one-by-one
         for h in batch:
             tmp = gpt_signal_info(h)
             results.append({"headline":h, **tmp})
@@ -258,7 +256,8 @@ def fetch_logo(co: str) -> bytes | None:
     try:
         r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=6)
         if r.ok: return r.content
-    except: pass
+    except:
+        pass
     return None
 
 def export_pdf(row: dict, bullets: str, contacts: list[dict]) -> bytes:
@@ -355,15 +354,19 @@ def national_scan():
         bar.progress(i/len(SEED_KWS))
 
     prospects = dedup(prospects)
-
     infos = gpt_batch_signal_info([p["headline"] for p in prospects])
+
     by_co = defaultdict(list)
     for p in prospects:
         for inf in infos:
-            # inf["score"] is guaranteed float above
-            if inf["headline"]==p["headline"] and inf["score"]>=RELEVANCE_CUTOFF:
-                p["company"] = inf["company"]
-                by_co[inf["company"]].append(p)
+            # safely cast score before comparison
+            try:
+                sc = float(inf.get("score",0) or 0)
+            except:
+                continue
+            if inf.get("headline") == p["headline"] and sc >= RELEVANCE_CUTOFF:
+                p["company"] = inf.get("company","Unknown")
+                by_co[p["company"]].append(p)
                 break
 
     rows=[]
@@ -381,7 +384,7 @@ def national_scan():
         lat, lon = safe_geocode("", co)
         conn.execute(
             "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon)"
-            " VALUES(?,?,?,?,?,?,?)",
+            " VALUES(?,?,?,?,?,?)",
             (co, summ["summary"], json.dumps([summ["sector"]]),
              "New", lat, lon)
         )
