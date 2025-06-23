@@ -1,182 +1,240 @@
-import os, json, time, logging, datetime
+# fetch_signals.py
+import logging
+import json
+import datetime
+from urllib.parse import quote_plus
+from collections import defaultdict
+
+import streamlit as st
 import feedparser
 import requests
-from urllib.parse import quote_plus
 from geopy.geocoders import Nominatim
 from openai import OpenAI
-from openai.error import RateLimitError
 from fpdf import FPDF
 
 from utils import get_conn, ensure_tables
 
-# ───────── OpenAI client via Streamlit secrets ─────────
-import streamlit as st
+# ───────── OpenAI client ─────────
 client = OpenAI(api_key=st.secrets["OPENAI"]["api_key"])
 
 # ───────── Constants ─────────
+MAX_HEADLINES = 60          # how many to fetch per seed
 SEED_KWS = [
-    "land purchase", "acquired site", "build", "construction",
-    "expansion", "facility", "plant", "warehouse", "distribution center"
+    "land purchase", "acres", "site acquisition", "plant",
+    "warehouse", "distribution center", "factory", "expansion"
 ]
-MAX_HEADLINES = 60
-RSS_DAYS = 30
-GD_TIMEOUT = 15
+RELEVANCE_THRESHOLD = 0.3  # for national_scan scoring
 
-# ───────── Safe Chat ─────────
+# ───────── Helpers ─────────
 def safe_chat(**kw):
+    """Wrapper around client.chat.completions.create that never raises."""
     try:
         return client.chat.completions.create(**kw)
-    except RateLimitError:
-        logging.warning("OpenAI rate-limit; skipping call.")
+    except Exception as e:
+        logging.warning(f"OpenAI error (skipping call): {e}")
         return None
 
-# ───────── Summarize Headlines ─────────
-def summarise(company, heads):
-    prompt = (
-        f"Summarize these headlines for {company} "
-        f"into a JSON object with keys summary (bullet list), sector (single word), confidence (0–1), land_flag (0/1):\n\n"
-        + "\n".join(f"- {h['headline']}" for h in heads[:10])
-    )
-    rsp = safe_chat(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.2,
-        max_tokens=200
-    )
-    if not rsp: return {}
-    return json.loads(rsp.choices[0].message.content)
-
-# ───────── RSS & GDELT Helpers ─────────
-def rss_search(query: str, days:int=RSS_DAYS, maxrec:int=MAX_HEADLINES):
+def rss_search(query: str, days: int = 30, maxrec: int = MAX_HEADLINES):
+    """Pull Google News RSS for the past `days` days."""
     q = quote_plus(f'{query} when:{days}d')
     url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(url)
     return feed.entries[:maxrec]
 
-def gdelt_headlines(query:str, days:int=RSS_DAYS, maxrec:int=MAX_HEADLINES):
-    dt_to = datetime.date.today()
-    dt_from = dt_to - datetime.timedelta(days=days)
+def gdelt_search(query: str, days: int = 30, maxrec: int = MAX_HEADLINES):
+    """Fallback to GDELT v2 if RSS is empty."""
+    dt = datetime.date.today()
+    dt0 = dt - datetime.timedelta(days=days)
+    gquery = f'"{query}" AND ({dt0:%Y%m%d} TO {dt:%Y%m%d})'
     url = (
-        f"https://api.gdeltproject.org/api/v2/doc/docsearch?"
-        f"query=\"{quote_plus(query)}\" AND {dt_from.strftime('%Y%m%d')} TO {dt_to.strftime('%Y%m%d')}"
-        f"&mode=ArtList&maxrecords={maxrec}&format=json"
+        "https://api.gdeltproject.org/api/v2/doc/docsearch"
+        f"?query={quote_plus(gquery)}&mode=ArtList&maxrecords={maxrec}&format=json"
     )
     try:
-        r = requests.get(url, timeout=GD_TIMEOUT).json()
-        arts = r.get("articles", [])
-        return [{"headline":a["title"], "url":a["url"], "date":a["seendate"]} for a in arts]
+        resp = requests.get(url, timeout=10).json()
+        return resp.get("articles", [])
     except Exception:
-        logging.warning("GDELT timeout → falling back to RSS")
+        logging.warning("GDELT timeout or parse error, returning empty.")
         return []
 
-def dedup(rows: list[dict]) -> list[dict]:
-    seen_t, seen_u, out = set(), set(), []
-    for r in rows:
-        t,u = r["headline"].lower(), r["url"].lower()
-        if t in seen_t or u in seen_u: continue
-        seen_t.add(t); seen_u.add(u); out.append(r)
-    return out
+def fetch_for_seed(seed: str):
+    """Get raw headlines for a single keyword seed."""
+    # 1) Try RSS
+    hits = []
+    for e in rss_search(seed):
+        hits.append({
+            "headline": e.title,
+            "url": e.link,
+            "date": e.published
+        })
+    # 2) If none, fall back to GDELT
+    if not hits:
+        for art in gdelt_search(seed):
+            hits.append({
+                "headline": art.get("title", ""),
+                "url": art.get("url", ""),
+                "date": art.get("seendate", "")
+            })
+    return hits[:MAX_HEADLINES]
 
-# ───────── Manual Search ─────────
-def _set_cached_raw(seed, hits):
-    db = get_conn()
-    now = datetime.datetime.utcnow().isoformat()
-    cur = db.cursor()
-    for h in hits:
-        cur.execute(
-            "INSERT OR REPLACE INTO raw_cache(seed,fetched,headline,url,date) VALUES(?,?,?,?,?)",
-            (seed, now, h["headline"], h["url"], h["date"])
+def summarise_headlines(company: str, headlines: list[str]):
+    """Ask GPT to score & extract company from each headline."""
+    prompt = (
+        f"Company: {company}\n\n"
+        "For each of these headlines:\n"
+        + "\n".join(f"- {h}" for h in headlines[:10])
+        + "\n\nReturn JSON list of objects with keys: headline, score (0–1), company."
+    )
+    rsp = safe_chat(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.2, max_tokens=300
+    )
+    if not rsp:
+        return []
+    try:
+        return json.loads(rsp.choices[0].message.content)
+    except Exception:
+        logging.warning("Failed to parse GPT summary JSON")
+        return []
+
+def geocode_company(name: str):
+    """Return (lat, lon) or (None, None)."""
+    geo = Nominatim(user_agent="lead_master")
+    try:
+        loc = geo.geocode(name, timeout=10)
+        return (loc.latitude, loc.longitude) if loc else (None, None)
+    except Exception:
+        return (None, None)
+
+# ───────── Manual search (UI) ─────────
+def manual_search(company: str):
+    """Fetch, dedupe, summarise & return (info, raw, lat, lon)."""
+    raw = fetch_for_seed(company)
+    # dedupe by headline/url
+    seen = set(); out = []
+    for h in raw:
+        key = (h["headline"], h["url"])
+        if key in seen: continue
+        seen.add(key); out.append(h)
+    heads = out[:MAX_HEADLINES]
+    # GPT summary just returns a short executive summary + sector/confidence
+    info = {"summary": "", "sector": "unknown", "confidence": 0}
+    if heads:
+        # very basic summarisation prompt
+        prompt = (
+            f"Summarize these {len(heads)} headlines about {company} "
+            "focusing on land or construction signals. Return JSON "
+            '{"summary": "...", "sector": "...", "confidence": 0-1}.'
         )
-    db.commit()
-    db.close()
+        rsp = safe_chat(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2, max_tokens=200
+        )
+        if rsp:
+            try:
+                info = json.loads(rsp.choices[0].message.content)
+            except Exception:
+                logging.warning("Failed to parse exec summary JSON")
+    lat, lon = geocode_company(company)
+    return info, heads, lat, lon
 
-def _fetch_for_seed(seed:str):
-    raw = rss_search(seed) or gdelt_headlines(seed)
-    hits = [{"headline":e.title, "url":e.link, "date":getattr(e,"published", "")} for e in raw]
-    hits = dedup(hits)[:MAX_HEADLINES]
-    _set_cached_raw(seed, hits)
-    return hits
-
-def manual_search(company:str):
-    ensure_tables()
-    # Fetch headlines
-    raw = _fetch_for_seed(company)
-    if not raw:
-        return {}, [], None, None
-
-    # Summarize
-    summ = summarise(company, raw)
-
-    # Geocode
-    geo = Nominatim(user_agent="lead_master").geocode(company)
-    lat, lon = (geo.latitude, geo.longitude) if geo else (None, None)
-
-    # Return summary, raw list, lat, lon
-    return summ, raw, lat, lon
-
-# ───────── National Scan ─────────
+# ───────── National scan (sidebar) ─────────
 def national_scan():
-    ensure_tables()
+    """
+    Run through each seed KW:
+      • RSS → GDELT
+      • dedupe
+      • get gpt_summary = summarise_headlines(...)
+      • group by company
+      • save into SQLite (clients + signals tables)
+    """
     conn = get_conn()
-    c = conn.cursor()
-
+    ensure_tables(conn)
     sidebar = st.sidebar
-    sidebar.markdown("### 🗂 National Scan")
-    bar = sidebar.progress(0)
-    status = sidebar.empty()
-
+    sidebar.info("📡 Fetching…")
     all_hits = []
-    for i,kw in enumerate(SEED_KWS, start=1):
-        status.markdown(f"[{i}/{len(SEED_KWS)}] Scanning **{kw}**…")
-        hits = rss_search(kw) or gdelt_headlines(kw)
-        hits = [{"seed":kw, **h} for h in dedup(hits)[:MAX_HEADLINES]]
-        all_hits += hits
-        bar.progress(i/len(SEED_KWS))
-
-    # Score and assign companies
-    sidebar.markdown("📝 Scoring…")
-    scored = []
+    for i, kw in enumerate(SEED_KWS, 1):
+        sidebar.progress((i-1)/len(SEED_KWS), text=f"[{i}/{len(SEED_KWS)}] {kw}")
+        hits = fetch_for_seed(kw)
+        # attach seed for debugging
+        for h in hits:
+            h["seed"] = kw
+        all_hits.extend(hits)
+    sidebar.success("✅ Fetched")
+    # dedupe globally
+    seen = set(); prospects = []
     for h in all_hits:
-        info = summarise(h["seed"], [h])
-        if info.get("confidence",0) >= 0.5 and info.get("land_flag",0)==1:
-            h.update(info)
-            scored.append(h)
+        key = (h["headline"], h["url"])
+        if key in seen: continue
+        seen.add(key); prospects.append(h)
+    sidebar.info(f"🌀 Scoring {len(prospects)}…")
+    scored = []
+    for idx, p in enumerate(prospects, 1):
+        sidebar.progress(idx/len(prospects))
+        info = summarise_headlines(p["headline"], [p["headline"]])
+        if not info: continue
+        rec = {**p, **info[0]}  # take first object from GPT
+        if rec.get("score", 0) >= RELEVANCE_THRESHOLD:
+            scored.append(rec)
+    sidebar.success(f"🏷 {len(scored)} relevant")
 
-    # Dedup by headline
-    final = dedup(scored)
+    # group by company and persist
+    by_co = defaultdict(list)
+    for r in scored:
+        co = r.get("company") or r["seed"]
+        by_co[co].append(r)
 
-    # Insert into signals table
-    now = datetime.datetime.utcnow().isoformat()
-    for f in final:
-        c.execute("""
-            INSERT OR REPLACE INTO signals(company,headline,url,date,score,read)
-            VALUES(?,?,?,?,?,COALESCE((SELECT read FROM signals WHERE url=?),0))
-        """, (
-            f.get("seed",""),
-            f["headline"], f["url"], f["date"] or now,
-            f.get("confidence",0.0), f["url"]
-        ))
+    for co, recs in by_co.items():
+        # save client summary with latest
+        summ = recs[0]
+        lat, lon = geocode_company(co)
+        conn.execute(
+            "INSERT OR REPLACE INTO clients(name,summary,sector_tags,status,lat,lon) "
+            "VALUES(?,?,?,?,?,?)",
+            (co, summ.get("summary",""), json.dumps([summ.get("sector","")]), "New", lat, lon)
+        )
+        # save each signal
+        for r in recs:
+            conn.execute(
+                "INSERT OR REPLACE INTO signals(company,headline,url,date) VALUES(?,?,?,?)",
+                (co, r["headline"], r["url"], r.get("date",""))
+            )
     conn.commit()
-    conn.close()
-    sidebar.success(f"✅ Finished: {len(final)} new signals.")
-    bar.empty()
-    status.empty()
+    sidebar.success("💾 Saved to library")
+    st.experimental_rerun()
 
-# ───────── Export to PDF ─────────
-def export_pdf(company:str, headline:str, summary:str, contacts:dict):
+# ───────── Export PDF ─────────
+def export_pdf(company: str, headline: str, url: str, contacts: dict):
+    """
+    Create a one-page PDF summarizing:
+      company, headline, URL, contact info
+    """
     pdf = FPDF()
+    pdf.set_auto_page_break(True, margin=15)
     pdf.add_page()
-    pdf.set_font("Helvetica", size=16, style="B")
-    pdf.cell(0,10,f"{company} — Executive Summary", ln=True)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, f"{company}", ln=True)
     pdf.set_font("Helvetica", size=12)
-    for line in summary.strip().split("\n"):
-        pdf.multi_cell(0,8,line.strip())
-    pdf.ln(5)
-    pdf.set_font("Helvetica", size=14, style="B")
-    pdf.cell(0,8,"Contacts:", ln=True)
+    pdf.multi_cell(0, 8, f"• Headline: {headline}")
+    pdf.multi_cell(0, 8, f"• URL: {url}")
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, "Contacts:", ln=True)
     pdf.set_font("Helvetica", size=12)
-    for name,info in contacts.items():
-        pdf.multi_cell(0,6,f"{name}: {info}")
-    out = f"export_{company.replace(' ','_')}.pdf"
-    pdf.output(out)
-    return out
+    for role, info in contacts.items():
+        pdf.multi_cell(0, 8, f"– {role}: {info}")
+    return pdf.output(dest="S").encode("latin1")
+
+# ───────── Company contacts stub ─────────
+def company_contacts(company: str):
+    """
+    Scrape or stub out procurement/facilities contacts.
+    For now we just return an empty dict to be filled manually.
+    """
+    return {
+        "Procurement": "",
+        "Facilities": "",
+        "Engineering": ""
+    }
