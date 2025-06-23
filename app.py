@@ -1,4 +1,3 @@
-```python
 # app.py
 import streamlit as st
 import pandas as pd
@@ -119,4 +118,3 @@ if "overlay" in st.session_state:
     st.markdown(f"**Sector:** {summary.get('sector','unknown')} | **Confidence:** {summary.get('confidence',0)}")
     st.markdown("**Headlines (tick to save):**")
     # manual save UI omitted for brevity
-```
