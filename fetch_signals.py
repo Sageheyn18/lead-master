@@ -1,6 +1,5 @@
-# fetch_signals.py — Lead Master with Google News → GDELT fallback (2025-06-23)
+# fetch_signals.py — Lead Master Google-RSS → GDELT (no NewsAPI, UI key) 2025-06-23
 
-import os
 import json
 import time
 import datetime
@@ -22,11 +21,16 @@ import magic
 
 from utils import get_conn, ensure_tables
 
-# ───────── CONFIG ─────────
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
-client     = OpenAI(api_key=OPENAI_KEY)
-geocoder   = Nominatim(user_agent="lead-master")
+# ───────── USER-PROVIDED OPENAI KEY ─────────
+# Prompt user to enter their key once per session:
+OPENAI_KEY = st.sidebar.text_input(
+    "🔑 OpenAI API Key", type="password", help="Paste your OpenAI key here"
+)
+if not OPENAI_KEY:
+    st.sidebar.warning("⚠️ Enter your OpenAI key to enable summaries.")
+client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
+# ───────── GLOBAL SETTINGS ─────────
 MAX_HEADLINES    = 20
 RELEVANCE_CUTOFF = 0.45
 SUMMARY_THROTTLE = 10
@@ -37,8 +41,7 @@ KEYWORDS = [
     "construction", "facility", "plant",
     "warehouse", "distribution center"
 ]
-EXTRA_KWS = ["land", "acres", "site", "build",
-             "construction", "expansion", "facility"]
+EXTRA_KWS = ["land", "acres", "site", "build", "construction", "expansion", "facility"]
 
 # ───────── DATABASE SETUP ─────────
 def init_db():
@@ -48,13 +51,14 @@ def init_db():
 
 # ───────── HELPERS ─────────
 def dedup(rows):
-    seen, out = set(), []
+    seen = set(); out = []
     for r in rows:
         key = (r.get("headline","").lower(), r.get("url","").lower())
         if key in seen: continue
         seen.add(key); out.append(r)
     return out
 
+geocoder = Nominatim(user_agent="lead-master")
 def safe_geocode(q):
     try:
         loc = geocoder.geocode(q, timeout=10)
@@ -63,6 +67,8 @@ def safe_geocode(q):
         return None, None
 
 def safe_chat(**kw):
+    if not client:
+        return None
     try:
         return client.chat.completions.create(**kw)
     except RateLimitError:
@@ -71,6 +77,7 @@ def safe_chat(**kw):
 
 # ───────── GPT SUMMARY ─────────
 def gpt_summary(company, headlines):
+    """Return {summary,sector,confidence,land_flag} via GPT."""
     global _LAST_SUMMARY
     wait = SUMMARY_THROTTLE - (time.time() - _LAST_SUMMARY)
     if wait > 0: time.sleep(wait)
@@ -81,7 +88,7 @@ def gpt_summary(company, headlines):
 
     prompt = textwrap.dedent(f"""
         Summarise in 5 bullet points. Guess sector.
-        land_flag=1 if a land purchase is indicated.
+        Set land_flag=1 if a land purchase is indicated.
         Return EXACT JSON {{summary,sector,confidence,land_flag}}.
 
         Headlines:
@@ -95,13 +102,8 @@ def gpt_summary(company, headlines):
         max_tokens=220
     )
     if not rsp:
-        # fallback short
-        return {
-            "summary": headlines[0][:120]+"…",
-            "sector": "unknown",
-            "confidence": 0,
-            "land_flag": 0
-        }
+        # fallback to first headline snippet
+        return {"summary":headlines[0][:120]+"…","sector":"unknown","confidence":0,"land_flag":0}
 
     try:
         out = json.loads(rsp.choices[0].message.content)
@@ -109,18 +111,11 @@ def gpt_summary(company, headlines):
         out["land_flag"]  = int(out.get("land_flag",0))
         return out
     except:
-        return {
-            "summary": rsp.choices[0].message.content,
-            "sector": "unknown",
-            "confidence": 0,
-            "land_flag": 0
-        }
+        return {"summary":rsp.choices[0].message.content,"sector":"unknown","confidence":0,"land_flag":0}
 
 # ───────── GDELT FALLBACK ─────────
 def gdelt_search(query, days=30, maxrecords=20):
-    """
-    Query GDELT v2 docsearch API. Returns list of dicts with 'title','url','date'.
-    """
+    """Return list of {'headline','url','date'} from GDELT v2."""
     today = datetime.date.today()
     since = today - datetime.timedelta(days=days)
     q = quote_plus(f'"{query}" AND ({since:%Y%m%d} TO {today:%Y%m%d})')
@@ -133,51 +128,43 @@ def gdelt_search(query, days=30, maxrecords=20):
         "&format=json"
     )
     try:
-        r = requests.get(url, timeout=15)
-        j = r.json()
+        j = requests.get(url, timeout=15).json()
         docs = j.get("articles") or j.get("docs") or []
-        out = []
-        for d in docs:
-            out.append({
-                "headline": d.get("title",""),
-                "url":      d.get("url",""),
-                "date":     d.get("seendate","")
-            })
-        return out
+        return [{"headline":d.get("title",""), "url":d.get("url",""), "date":d.get("seendate","")} for d in docs]
     except:
         return []
 
 # ───────── MANUAL SEARCH ─────────
 def manual_search(company: str):
     """
-    1) Google News RSS for past 30 days
-    2) Fall back to GDELT
+    1) Google News RSS (30d)
+    2) GDELT fallback
     Returns: (info, headlines, lat, lon)
     """
-    # build RSS query with keywords
+    # build RSS query
     kw_expr = " OR ".join(EXTRA_KWS)
-    rss_q = f'{company} ({kw_expr}) when:30d'
+    rss_q   = f'{company} ({kw_expr}) when:30d'
     rss_url = (
         "https://news.google.com/rss/search?"
-        f"q={quote_plus(rss_q)}"
-        "&hl=en-US&gl=US&ceid=US:en"
+        f"q={quote_plus(rss_q)}&hl=en-US&gl=US&ceid=US:en"
     )
-    feed = feedparser.parse(rss_url)
+    feed    = feedparser.parse(rss_url)
     entries = feed.entries
 
-    # fallback if no RSS or error
+    # fallback to GDELT
     if not entries:
-        entries = gdelt_search(company, days=30, maxrecords=MAX_HEADLINES)
+        gd = gdelt_search(company, days=30, maxrecords=MAX_HEADLINES)
+        entries = [{"title":g["headline"], "link":g["url"], "published":g["date"]} for g in gd]
 
-    # normalize
+    # normalize & filter
     rows = []
     for e in entries:
         title = e.get("title", getattr(e, "headline",""))
-        link  = e.get("link",  getattr(e, "url",""))
-        date  = e.get("published", e.get("date",""))
+        link  = e.get("link", getattr(e, "url",""))
+        date  = e.get("published","")
         rows.append({"headline":title, "url":link, "date":date})
-    # dedupe & limit
-    uniq  = dedup(rows)
+    rows = [r for r in rows if any(kw in r["headline"].lower() for kw in EXTRA_KWS)]
+    uniq = dedup(rows)
     heads = [u["headline"] for u in uniq][:MAX_HEADLINES]
 
     if not heads:
@@ -190,8 +177,9 @@ def manual_search(company: str):
 # ───────── NATIONAL SCAN ─────────
 def national_scan():
     """
-    Iterate KEYWORDS, do RSS → GDELT fallback per keyword,
-    dedupe, GPT-summarise and write to clients & signals tables.
+    For each KEYWORD:
+      Google RSS → GDELT fallback → dedupe
+    GPT-summarise + write into clients & signals.
     """
     conn    = init_db()
     sidebar = st.sidebar
@@ -204,38 +192,34 @@ def national_scan():
     for idx, kw in enumerate(KEYWORDS, start=1):
         sidebar.write(f"[{idx}/{len(KEYWORDS)}] {kw}")
 
-        # primary: Google News RSS
-        rss_q   = f'{kw} when:30d'
+        # 1) Google RSS
         rss_url = (
             "https://news.google.com/rss/search?"
-            f"q={quote_plus(rss_q)}"
-            "&hl=en-US&gl=US&ceid=US:en"
+            f"q={quote_plus(f'{kw} when:30d')}&hl=en-US&gl=US&ceid=US:en"
         )
         feed    = feedparser.parse(rss_url)
         hits    = feed.entries
-
         sidebar.write(f" • RSS: {len(hits)}")
 
-        # fallback
+        # 2) fallback GDELT
         if not hits:
             gd = gdelt_search(kw, days=30, maxrecords=50)
-            hits = [{"title":d["headline"], "link":d["url"], "published":d["date"]} for d in gd]
+            hits = [{"title":g["headline"], "link":g["url"], "published":g["date"]} for g in gd]
             sidebar.write(f" • GDELT: {len(gd)}")
 
         # normalize
         raw = []
         for e in hits:
-            title = e.get("title", e.get("headline",""))
-            link  = e.get("link",  e.get("url",""))
-            date  = e.get("published", e.get("date",""))
+            title = e.get("title", getattr(e,"headline",""))
+            link  = e.get("link",  getattr(e,"url",""))
+            date  = e.get("published","")
             raw.append({"headline":title, "url":link, "date":date})
         uniq = dedup(raw)
         sidebar.write(f" • Deduped: {len(uniq)}")
-
         all_hits.extend(uniq)
         sidebar.progress(idx / len(KEYWORDS))
 
-    # group by company via GPT on each headline
+    # score + group
     sidebar.write("📝 Scoring…")
     scored = []
     for hit in all_hits:
@@ -245,12 +229,12 @@ def national_scan():
     by_co = defaultdict(list)
     for s in scored:
         if s["confidence"] >= RELEVANCE_CUTOFF:
-            by_co[s["sector"]].append(s)
+            by_co[s.get("sector","Unknown")].append(s)
 
     # write to DB
     sidebar.write("💾 Saving…")
     for co, items in by_co.items():
-        heads = [i["headline"] for i in items]
+        heads   = [i["headline"] for i in items]
         summary = gpt_summary(co, heads)
         lat, lon = safe_geocode(f"{co} headquarters")
 
@@ -259,17 +243,17 @@ def national_scan():
             "(name,summary,sector_tags,status,lat,lon) VALUES(?,?,?,?,?,?)",
             (co, summary["summary"], json.dumps([summary["sector"]]), "New", lat, lon)
         )
-        for i in items:
+        for it in items:
             conn.execute(
                 "INSERT OR REPLACE INTO signals "
                 "(company,headline,url,date) VALUES(?,?,?,?)",
-                (co, i["headline"], i["url"], i["date"])
+                (co, it["headline"], it["url"], it["date"])
             )
     conn.commit()
     sidebar.success("✅ National scan complete!")
 
 # ───────── CONTACTS ─────────
-def company_contacts(company):
+def company_contacts(company: str):
     prompt = (
         f"List up to 3 procurement/engineering/construction "
         f"contacts for {company} as JSON array of {{name,title,email,phone}}."
@@ -287,8 +271,8 @@ def company_contacts(company):
     except:
         return []
 
-# ───────── LOGO FETCH ─────────
-def fetch_logo(company):
+# ───────── LOGO ─────────
+def fetch_logo(company: str):
     dom = company.replace(" ","")+".com"
     try:
         r = requests.get(f"https://logo.clearbit.com/{dom}", timeout=5)
@@ -301,27 +285,27 @@ def fetch_logo(company):
 # ───────── PDF EXPORT ─────────
 def export_pdf(row, summary_text, contacts):
     pdf = FPDF()
-    pdf.set_auto_page_break(True, 15)
+    pdf.set_auto_page_break(True,15)
     pdf.add_page()
-
+    # logo
     logo = fetch_logo(row.get("company",""))
     if logo:
-        ext = magic.from_buffer(logo,mime=True).split("/")[-1]
+        ext = magic.from_buffer(logo, mime=True).split("/")[-1]
         fn  = f"/tmp/logo.{ext}"
         open(fn,"wb").write(logo)
         pdf.image(fn,10,10,20)
         pdf.set_xy(35,10)
-
+    # title
     pdf.set_font("Helvetica","B",16)
-    pdf.multi_cell(0,10,row.get("company",""))
+    pdf.multi_cell(0,10, row.get("company",""))
     pdf.ln(5)
-
+    # summary
     pdf.set_font("Helvetica","",12)
-    for line in summary_text.split("\n"):
-        if line.strip():
-            pdf.multi_cell(0,7,"• "+line.strip())
+    for l in summary_text.split("\n"):
+        if l.strip():
+            pdf.multi_cell(0,7,"• "+l.strip())
     pdf.ln(3)
-
+    # contacts
     if contacts:
         pdf.set_font("Helvetica","B",13)
         pdf.cell(0,8,"Key Contacts",ln=1)
@@ -332,19 +316,18 @@ def export_pdf(row, summary_text, contacts):
                 f"{c.get('email','')}   {c.get('phone','')}"
             )
             pdf.ln(1)
-
+    # footer
     pdf.set_y(-30)
     pdf.set_font("Helvetica","I",9)
-    pdf.multi_cell(0,5,f"Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}")
-
+    pdf.multi_cell(0,5, f"Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}")
     return pdf.output(dest="S").encode("latin-1")
 
-# ───────── PERMITS CSV ─────────
+# ───────── PERMITS ─────────
 def fetch_permits():
     path = "permits.csv"
     if not os.path.exists(path):
         return []
-    out = []
+    out=[]
     with open(path,newline="",encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for r in reader:
