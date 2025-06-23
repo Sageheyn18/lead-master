@@ -1,4 +1,4 @@
-# fetch_signals.py — Lead Master v11.0
+# fetch_signals.py — Lead Master v11.1
 
 import os
 import json
@@ -7,24 +7,23 @@ import datetime
 import logging
 import textwrap
 import sqlite3
-import threading
 import csv
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 
+import requests
 import feedparser
 import streamlit as st
 from geopy.geocoders import Nominatim
 from openai import OpenAI, RateLimitError
 from fpdf import FPDF
 import magic
-import requests
 
 from utils import get_conn, ensure_tables
 
 # ───────── OpenAI client via Streamlit secrets ─────────
-# Ensure you have .streamlit/secrets.toml with:
+# Make sure you have .streamlit/secrets.toml with:
 # OPENAI_API_KEY = "sk-..."
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
@@ -83,7 +82,6 @@ def safe_chat(**kw):
 
 # ───────── BATCHED GPT SUMMARY ─────────
 def gpt_summary_batch(headlines: list[str]) -> dict|None:
-    """Summarize up to MAX_HEADLINES headlines in one call."""
     prompt = textwrap.dedent("""
       You are an assistant. Given these headlines indicating potential
       land purchases or new construction, please:
@@ -110,7 +108,6 @@ def gpt_summary_batch(headlines: list[str]) -> dict|None:
         return None
 
 def gpt_summary_single(headline: str) -> dict:
-    """Return cached or freshly GPT’d summary for one headline."""
     cached = get_cached(headline)
     if cached:
         return cached
@@ -122,21 +119,17 @@ def gpt_summary_single(headline: str) -> dict:
     set_cached(headline, info)
     return info
 
-# ───────── gpt_summary WRAPPER ─────────
+# ───────── WRAPPER ─────────
 def gpt_summary(company: str, headlines: list[str]) -> dict:
-    """
-    For manual_search: summarize a batch of headlines for the company,
-    returning only summary/sector/confidence/land_flag.
-    """
     info = gpt_summary_batch(headlines) or {}
     return {
-        "summary":   info.get("summary",""),
-        "sector":    info.get("sector","unknown"),
-        "confidence":info.get("confidence",0.0),
-        "land_flag": int(info.get("land_flag",0))
+        "summary":    info.get("summary",""),
+        "sector":     info.get("sector","unknown"),
+        "confidence": info.get("confidence",0.0),
+        "land_flag":  int(info.get("land_flag",0))
     }
 
-# ───────── GEOLOCATOR ─────────
+# ───────── GEO ─────────
 _geo = Nominatim(user_agent="lead-master")
 def geocode_company(name: str) -> tuple[float|None,float|None]:
     try:
@@ -145,26 +138,24 @@ def geocode_company(name: str) -> tuple[float|None,float|None]:
     except:
         return (None,None)
 
-# ───────── RSS & GDELT HELPERS ─────────
+# ───────── RSS & GDELT ─────────
 def rss_search(query: str, days:int=30, maxrec:int=60):
-    """Google News RSS past `${days}` days."""
-    q = quote_plus(f'{query} when:{days}d')
-    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(url)
+    q     = quote_plus(f'{query} when:{days}d')
+    url   = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    feed  = feedparser.parse(url)
     return feed.entries[:maxrec]
 
 def gdelt_search(query: str, days:int=30, maxrec:int=60):
-    """GDELT fallback search."""
     today = datetime.date.today()
     since = today - datetime.timedelta(days=days)
-    q = quote_plus(f'"{query}" AND ({since:%Y%m%d} TO {today:%Y%m%d})')
-    url = (
+    q     = quote_plus(f'"{query}" AND ({since:%Y%m%d} TO {today:%Y%m%d})')
+    url   = (
       "https://api.gdeltproject.org/api/v2/doc/docsearch"
       f"?query={q}&filter=SourceCommonName:NEWS&mode=ArtList"
       f"&maxrecords={maxrec}&format=json"
     )
     try:
-        j = requests.get(url,timeout=15).json()
+        j    = requests.get(url,timeout=15).json()
         docs = j.get("articles") or j.get("docs") or []
         return docs
     except:
@@ -172,98 +163,77 @@ def gdelt_search(query: str, days:int=30, maxrec:int=60):
 
 # ───────── MANUAL SEARCH ─────────
 def manual_search(company: str):
-    """
-    Lookup company:
-      1) RSS → fallback GDELT
-      2) dedupe & filter by keywords
-      3) batch GPT summary + per-headline GPT details in parallel
-      4) geocode
-    Returns: (info, detailed_list, lat, lon)
-    """
-    kws = ["land","acres","site","build","construction","expansion","facility"]
-    expr = company + " (" + " OR ".join(kws) + ")"
+    kws     = ["land","acres","site","build","construction","expansion","facility"]
+    expr    = company + " (" + " OR ".join(kws) + ")"
     entries = rss_search(expr) or [
-        {"title":d["headline"],"link":d["url"],"published":d["date"]}
+        {"headline":d["headline"],"url":d["url"],"date":d["date"]}
         for d in gdelt_search(expr)
     ]
 
     rows = []
     for e in entries:
         title = e.get("title", getattr(e,"headline",""))
-        url   = e.get("link", getattr(e,"url",""))
+        url   = e.get("link",  getattr(e,"url",""))
         date  = e.get("published", e.get("date",""))
         rows.append({"headline":title,"url":url,"date":date})
-    # filter & dedupe
-    rows = [r for r in rows if any(k in r["headline"].lower() for k in kws)]
-    deduped = []
-    seen = set()
-    for r in rows:
-        t = r["headline"].lower()
-        if t not in seen:
-            seen.add(t); deduped.append(r)
+
+    filtered = [r for r in rows if any(k in r["headline"].lower() for k in kws)]
+    deduped  = []
+    seen     = set()
+    for r in filtered:
+        key = r["headline"].lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
     deduped = deduped[:MAX_HEADLINES]
 
-    # batch summary
-    info = gpt_summary(company, [r["headline"] for r in deduped])
-
-    # per-headline details in parallel
+    info     = gpt_summary(company, [r["headline"] for r in deduped])
     detailed = []
     with ThreadPoolExecutor(max_workers=4) as exe:
-        futs = {exe.submit(gpt_summary_single, r["headline"]): r for r in deduped}
+        futs = {exe.submit(gpt_summary_single,r["headline"]): r for r in deduped}
         for fut in as_completed(futs):
             base = futs[fut]
             inf  = fut.result()
-            detailed.append({**base, **inf})
+            detailed.append({**base,**inf})
 
     lat, lon = geocode_company(company)
     return info, detailed, lat, lon
 
 # ───────── NATIONAL SCAN ─────────
 def national_scan():
-    """
-    1) For each SEED_KWS, fetch RSS & fallback → dedupe
-    2) parallel gpt_summary_single on headlines
-    3) group by extracted company → write clients & signals
-    """
     conn = get_conn()
     ensure_tables(conn)
 
-    # gather
     raw = []
     for kw in SEED_KWS:
-        for e in rss_search(kw, maxrec=MAX_HEADLINES):
-            raw.append({"headline": e.title, "url": e.link, "seed": kw})
-
-    # fallback GDELT for any missing
+        raw.extend([{"headline":e.title,"url":e.link,"seed":kw}
+                    for e in rss_search(kw, maxrec=MAX_HEADLINES)])
     if not raw:
         for kw in SEED_KWS:
-            for d in gdelt_search(kw, maxrec=MAX_HEADLINES):
-                raw.append({"headline":d["headline"],"url":d["url"],"seed":kw})
+            raw.extend([{"headline":d["headline"],"url":d["url"],"seed":kw}
+                        for d in gdelt_search(kw,maxrec=MAX_HEADLINES)])
 
     # dedupe
     seen = set(); hits = []
     for r in raw:
-        t = r["headline"].lower()
-        if t not in seen:
-            seen.add(t); hits.append(r)
+        key = r["headline"].lower()
+        if key not in seen:
+            seen.add(key); hits.append(r)
     hits = hits[: MAX_HEADLINES * len(SEED_KWS)]
 
     # parallel summarize
     scored = []
     with ThreadPoolExecutor(max_workers=4) as exe:
-        futs = {exe.submit(gpt_summary_single,r["headline"]): r for r in hits}
+        futs = {exe.submit(gpt_summary_single,h["headline"]): h for h in hits}
         for fut in as_completed(futs):
-            base = futs[fut]
-            inf  = fut.result()
-            scored.append({**base, **inf})
+            base = futs[fut]; inf = fut.result()
+            scored.append({**base,**inf})
 
-    # group by company
     by_co = defaultdict(list)
     for s in scored:
         co = s.get("company") or s["seed"]
         by_co[co].append(s)
 
-    # write
     for co, recs in by_co.items():
         summary = gpt_summary(co,[r["headline"] for r in recs])
         lat, lon = geocode_company(co)
@@ -301,7 +271,7 @@ def company_contacts(company: str) -> list[dict]:
     except:
         return []
 
-# ───────── LOGO ─────────
+# ───────── LOGO FETCH ─────────
 def fetch_logo(company: str) -> bytes|None:
     dom = company.replace(" ","")+".com"
     try:
@@ -354,7 +324,7 @@ def export_pdf(row, summary_text, contacts) -> bytes:
 
 # ───────── PERMITS ─────────
 def fetch_permits() -> list[dict]:
-    path="permits.csv"
+    path = "permits.csv"
     if not os.path.exists(path):
         return []
     out=[]
