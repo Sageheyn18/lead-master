@@ -1,4 +1,4 @@
-# app.py — Lead Master v3.4 (2025-06-23)
+# app.py — Lead Master v3.5 (2025-06-23)
 
 import os
 import json
@@ -56,9 +56,7 @@ if st.sidebar.button("Go", key="go"):
     st.session_state["overlay"] = overlay_input
     st.experimental_rerun()
 
-# Display GPT spend with write (no hidden widget)
-spent = getattr(client.usage.today(), "total_cents", 0)
-st.sidebar.write(f"GPT spend: {spent}¢ / 300¢")
+# (Removed GPT spend display — client.usage isn’t available)
 
 # ───────── Page Selector ─────────
 page = st.sidebar.radio(
