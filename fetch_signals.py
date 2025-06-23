@@ -1,12 +1,13 @@
-# fetch_signals.py — Lead Master (fresh build)
+# fetch_signals.py — Lead Master (final full replacement)
 
 import os
 import json
-import datetime
-import sqlite3
-import logging
-import textwrap
 import csv
+import time
+import logging
+import sqlite3
+import datetime
+import textwrap
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote_plus
@@ -15,7 +16,8 @@ import requests
 import feedparser
 import streamlit as st
 from geopy.geocoders import Nominatim
-from openai import OpenAI, RateLimitError
+from openai import OpenAI
+from openai.error import RateLimitError
 from fpdf import FPDF
 import magic
 
@@ -46,7 +48,7 @@ def geocode_company(name: str):
 # ───────── DATABASE INITIALIZATION ─────────
 def _init_db():
     db = get_conn()
-    # raw hits cache
+    # Raw hits cache
     db.execute(f"""
       CREATE TABLE IF NOT EXISTS {RAW_CACHE_TABLE} (
         seed      TEXT,
@@ -57,7 +59,7 @@ def _init_db():
         PRIMARY KEY(seed, headline)
       )
     """)
-    # summary cache
+    # Summary cache
     db.execute(f"""
       CREATE TABLE IF NOT EXISTS {SUMMARY_CACHE_TBL} (
         headline   TEXT PRIMARY KEY,
@@ -68,7 +70,8 @@ def _init_db():
         company    TEXT
       )
     """)
-    ensure_tables(db)  # your existing clients & signals
+    # Ensure clients, signals, pipeline tables exist
+    ensure_tables(db)
     db.commit()
 
 _init_db()
@@ -87,11 +90,23 @@ def _set_cached_raw(seed: str, hits: list[dict]):
     db = get_conn()
     now = datetime.datetime.utcnow()
     for h in hits:
-        db.execute(
-            f"INSERT OR REPLACE INTO {RAW_CACHE_TABLE}"
-            "(seed,fetched,headline,url,date) VALUES(?,?,?,?,?)",
-            (seed, now, h["headline"], h["url"], h["date"])
+        sql = (
+            f"INSERT OR REPLACE INTO {RAW_CACHE_TABLE} "
+            "(seed,fetched,headline,url,date) VALUES(?,?,?,?,?)"
         )
+        params = (seed, now, h["headline"], h["url"], h["date"])
+        retries = 5
+        while True:
+            try:
+                db.execute(sql, params)
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and retries > 0:
+                    retries -= 1
+                    time.sleep(0.2)
+                else:
+                    logging.error(f"DB write failed for raw cache: {e}")
+                    break
     db.commit()
 
 # ───────── SAFE OPENAI CALL ─────────
@@ -141,7 +156,7 @@ def _map_headlines_to_company(headlines: list[str]) -> dict[str,str]:
     prompt = textwrap.dedent("""
       You are an assistant. For each of these news headlines,
       extract the primary COMPANY name mentioned.
-      Return EXACT JSON array of {"headline": "...", "company": "..."}.
+      Return EXACT JSON array [{"headline":"...","company":"..."}, …].
     """).strip() + "\n\nHeadlines:\n" + "\n".join(f"- {h}" for h in headlines)
     rsp = safe_chat(
         model="gpt-3.5-turbo",
@@ -157,7 +172,7 @@ def _map_headlines_to_company(headlines: list[str]) -> dict[str,str]:
     except:
         return {}
 
-# ───────── GPT SUMMARY ─────────
+# ───────── GPT SUMMARIES ─────────
 def gpt_summary_batch(headlines: list[str]) -> dict|None:
     prompt = textwrap.dedent("""
       You are an assistant. Given these headlines, please:
@@ -204,46 +219,34 @@ def gpt_summary(company: str, headlines: list[str]) -> dict:
 
 # ───────── RSS & GDELT FETCH ─────────
 def _fetch_for_seed(seed: str) -> list[dict]:
-    # try cache
     cached = _get_cached_raw(seed)
     if cached:
         return cached
 
-    # build RSS query
     kws = ["land","acres","site","build","construction","expansion","facility"]
     expr = f'{seed} ({" OR ".join(kws)}) when:30d'
     url  = "https://news.google.com/rss/search?q=" + quote_plus(expr) + "&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(url)
-    hits = []
-    for e in feed.entries[:MAX_HEADLINES]:
-        hits.append({
-            "headline": e.title,
-            "url":       e.link,
-            "date":      getattr(e, "published", "")
-        })
+    hits = [{"headline": e.title, "url": e.link, "date": getattr(e, "published", "")}
+            for e in feed.entries[:MAX_HEADLINES]]
 
-    # fallback to GDELT if none
     if not hits:
         today = datetime.date.today()
         since = today - datetime.timedelta(days=30)
         q     = quote_plus(f'"{seed}" AND ({since:%Y%m%d} TO {today:%Y%m%d})')
         api   = (
             "https://api.gdeltproject.org/api/v2/doc/docsearch"
-            f"?query={q}&filter=SourceCommonName:NEWS"
-            f"&mode=ArtList&maxrecords={MAX_HEADLINES}&format=json"
+            f"?query={q}&filter=SourceCommonName:NEWS&mode=ArtList"
+            f"&maxrecords={MAX_HEADLINES}&format=json"
         )
         try:
             docs = requests.get(api, timeout=15).json().get("articles", [])
         except:
             docs = []
-        for d in docs:
-            hits.append({
-                "headline": d.get("headline") or d.get("title",""),
-                "url":       d.get("url",""),
-                "date":      d.get("date","")
-            })
+        hits = [{"headline": d.get("headline") or d.get("title",""),
+                 "url":       d.get("url",""),
+                 "date":      d.get("date","")} for d in docs]
 
-    # dedupe & cache
     seen, out = set(), []
     for h in hits:
         key = h["headline"].lower()
@@ -258,23 +261,18 @@ def _fetch_for_seed(seed: str) -> list[dict]:
 def manual_search(company: str):
     raw = _fetch_for_seed(company)
     if not raw:
-        return {"summary":""}, [], None, None
+        return {"summary": ""}, [], None, None
 
-    # map headlines→companies
     mapping = _map_headlines_to_company([r["headline"] for r in raw])
 
-    # prepare detailed rows in parallel
     detailed = []
     with ThreadPoolExecutor(max_workers=4) as exe:
-        futures = {
-            exe.submit(gpt_summary_single, r["headline"]): r for r in raw
-        }
+        futures = {exe.submit(gpt_summary_single, r["headline"]): r for r in raw}
         for fut in as_completed(futures):
-            base = futures[fut]
-            info = fut.result()
-            detailed.append({**base, **info})
+            r = futures[fut]
+            inf = fut.result()
+            detailed.append({**r, **inf})
 
-    # overall summary for primary company
     primary = mapping.get(raw[0]["headline"], company)
     summary = gpt_summary(primary, [r["headline"] for r in raw])
     lat, lon = geocode_company(primary)
@@ -283,14 +281,12 @@ def manual_search(company: str):
 
 # ───────── NATIONAL SCAN ─────────
 def national_scan():
-    # parallel fetch
     all_hits = []
     with ThreadPoolExecutor(max_workers=len(SEED_KWS)) as exe:
         futures = {exe.submit(_fetch_for_seed, kw): kw for kw in SEED_KWS}
         for fut in as_completed(futures):
             all_hits.extend(fut.result())
 
-    # dedupe
     seen, hits = set(), []
     for r in all_hits:
         key = r["headline"].lower()
@@ -299,34 +295,31 @@ def national_scan():
             hits.append(r)
     hits = hits[: MAX_HEADLINES * len(SEED_KWS)]
 
-    # map once
     mapping = _map_headlines_to_company([h["headline"] for h in hits])
 
-    # group by company and summarize
-    db = get_conn()
-    for company, group in defaultdict(list, {
-        mapping.get(h["headline"], h["headline"]): []
-        for h in hits
-    }).items():
-        heads = [h["headline"] for h in hits if mapping.get(h["headline"], h["headline"]) == company]
-        summary = gpt_summary(company, heads)
-        lat, lon = geocode_company(company)
-        tags = json.dumps(SEED_KWS)
+    groups = defaultdict(list)
+    for h in hits:
+        co = mapping.get(h["headline"], h["headline"])
+        groups[co].append(h)
 
-        # write client
+    db = get_conn()
+    for co, recs in groups.items():
+        head_list = [r["headline"] for r in recs]
+        summ   = gpt_summary(co, head_list)
+        lat,lon= geocode_company(co)
+        tags   = json.dumps(SEED_KWS)
+
         db.execute(
             "INSERT OR REPLACE INTO clients "
             "(name,summary,sector_tags,status,lat,lon) VALUES(?,?,?,?,?,?)",
-            (company, summary["summary"], tags, "New", lat, lon)
+            (co, summ["summary"], tags, "New", lat, lon)
         )
-        # write signals
-        for h in hits:
-            if mapping.get(h["headline"], h["headline"]) == company:
-                db.execute(
-                    "INSERT OR REPLACE INTO signals "
-                    "(company,headline,url,date,lat,lon) VALUES(?,?,?,?,?,?)",
-                    (company, h["headline"], h["url"], h["date"], lat, lon)
-                )
+        for r in recs:
+            db.execute(
+                "INSERT OR REPLACE INTO signals "
+                "(company,headline,url,date,lat,lon) VALUES(?,?,?,?,?,?)",
+                (co, r["headline"], r["url"], r["date"], lat, lon)
+            )
     db.commit()
     st.sidebar.success("✅ National scan complete!")
 
@@ -334,7 +327,7 @@ def national_scan():
 def company_contacts(company: str) -> list[dict]:
     prompt = (
         f"List up to 3 procurement/engineering/construction contacts for {company} "
-        "as JSON [{'{'}name,title,email,phone{'}'}]."
+        "as JSON [{\"name\",\"title\",\"email\",\"phone\"}]."
     )
     rsp = safe_chat(
         model="gpt-3.5-turbo",
@@ -412,7 +405,8 @@ def fetch_permits() -> list[dict]:
         return []
     out = []
     with open(path, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        for r in reader:
             lat, lon = geocode_company(r.get("company", ""))
             out.append({
                 "company":     r.get("company", ""),
