@@ -1,4 +1,3 @@
-```python
 # fetch_signals.py
 import os
 import logging
@@ -16,20 +15,14 @@ from fpdf import FPDF
 from utils import get_conn, ensure_tables
 
 # ───────── OpenAI Client ─────────
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    # fallback to Streamlit secrets
-    api_key = (
-        st.secrets.get("OPENAI", {}).get("api_key")
-        or st.secrets.get("OPENAI_API_KEY")
-    )
-
+api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 if not api_key:
     st.error(
-        "❌ OpenAI API key not found. Set the OPENAI_API_KEY environment variable,"
-        " or add it under [OPENAI] api_key in .streamlit/secrets.toml."
+        "❌ OpenAI API key not found. Set OPENAI_API_KEY environment variable,"
+        " or add OPENAI_API_KEY to .streamlit/secrets.toml under [default]."
     )
     st.stop()
+
 client = OpenAI(api_key=api_key)
 
 # ───────── Constants ─────────
@@ -37,20 +30,20 @@ SEED_KWS = [
     "land purchase", "acquired site", "build", "construction",
     "expansion", "facility", "plant", "warehouse", "distribution center"
 ]
-MAX_HEADLINES = 60  # reduce hit count for speed
+MAX_HEADLINES = 60  # limit results for performance
 
 # ───────── Helpers ─────────
 def safe_chat(**kwargs):
-    """Call OpenAI and skip on error (rate limits, connection issues)."""
+    """Call OpenAI and skip errors."""
     try:
         return client.chat.completions.create(**kwargs)
     except OpenAIError as e:
-        logging.warning(f"OpenAI error: {e!r}")
+        logging.warning(f"OpenAI error: {e}")
         return None
 
 
 def rss_search(query: str, days: int = 30, maxrec: int = MAX_HEADLINES):
-    """Fetch Google News RSS for the past `days` days (up to `maxrec`)."""
+    """Fetch Google News RSS for the past `days` days."""
     q = quote_plus(f"{query} when:{days}d")
     url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(url)
@@ -59,16 +52,16 @@ def rss_search(query: str, days: int = 30, maxrec: int = MAX_HEADLINES):
 # ───────── Manual Search ─────────
 def manual_search(company: str):
     """Lookup a single company: RSS → summarize → geocode."""
-    # 1) Fetch headlines
+    # Fetch headlines
     raw = []
-    for entry in rss_search(company, days=150, maxrec=MAX_HEADLINES):
+    for entry in rss_search(company, days=150):
         raw.append({
             "headline": entry.title,
             "url": entry.link,
             "date": getattr(entry, "published", None),
         })
 
-    # 2) Summarize via GPT
+    # Summarize via GPT
     if raw:
         prompt = (
             f"Summarize these headlines for {company}, focusing on land purchases or construction leads:\n"
@@ -84,7 +77,7 @@ def manual_search(company: str):
     else:
         summary = "No recent headlines found."
 
-    # 3) Geocode
+    # Geocode
     locator = Nominatim(user_agent="lead_master_app")
     loc = locator.geocode(company, timeout=10)
     lat, lon = (loc.latitude, loc.longitude) if loc else (None, None)
@@ -93,10 +86,7 @@ def manual_search(company: str):
 
 # ───────── National Scan ─────────
 def national_scan():
-    """
-    Runs through SEED_KWS → RSS → dedupe → score via GPT → group by company →
-    save into SQLite tables `clients` and `signals`.
-    """
+    """Fetch, dedupe, score, group by company, and save to SQLite."""
     conn = get_conn()
     ensure_tables()
     sidebar = st.sidebar
@@ -104,22 +94,21 @@ def national_scan():
     progress = sidebar.progress(0)
     all_hits = []
 
-    # 1) Fetch & dedupe
+    # 1) Fetch and dedupe
     for i, kw in enumerate(SEED_KWS, start=1):
         sidebar.write(f"[{i}/{len(SEED_KWS)}] Searching '{kw}'…")
         hits = rss_search(kw)
-        seen = set(); dedup = []
+        seen, deduped = set(), []
         for h in hits:
             key = (h.title.lower(), h.link.lower())
-            if key in seen:
-                continue
+            if key in seen: continue
             seen.add(key)
-            dedup.append({
+            deduped.append({
                 "headline": h.title,
                 "url": h.link,
                 "date": getattr(h, "published", None),
             })
-        all_hits.extend(dedup)
+        all_hits.extend(deduped)
         progress.progress(i / len(SEED_KWS))
 
     # 2) Score each via GPT
@@ -134,8 +123,7 @@ def national_scan():
             temperature=0.2,
             max_tokens=50,
         )
-        if not info:
-            continue
+        if not info: continue
         try:
             parsed = json.loads(info.choices[0].message.content)
             co = parsed.get("company")
@@ -147,7 +135,7 @@ def national_scan():
         except Exception:
             continue
 
-    # 3) Group by company & save
+    # 3) Group by company and save
     by_co = defaultdict(list)
     for s in scored:
         by_co[s["company"]].append(s)
@@ -158,7 +146,7 @@ def national_scan():
         loc = locator.geocode(co, timeout=10)
         lat, lon = (loc.latitude, loc.longitude) if loc else (None, None)
 
-        # upsert client
+        # Upsert client
         conn.execute(
             """
             INSERT OR REPLACE INTO clients
@@ -174,7 +162,7 @@ def national_scan():
                 lon,
             ),
         )
-        # insert signals
+        # Insert signals
         for p in projects:
             conn.execute(
                 """
@@ -194,9 +182,9 @@ def national_scan():
     conn.commit()
     sidebar.success("✅ National scan complete!")
 
-# ───────── Company Contacts (stub) ─────────
+# ───────── Company Contacts ─────────
 def company_contacts(company: str):
-    """Stub for your procurement/engineering contacts scrape."""
+    """Stub for procurement/engineering contacts lookup."""
     return {"procurement": None, "engineering": None, "construction": None}
 
 # ───────── Export PDF ─────────
@@ -210,8 +198,7 @@ def export_pdf(company: str, headline: str, contacts: dict):
     pdf.multi_cell(0, 8, f"Headline: {headline}")
     for role, contact in contacts.items():
         pdf.multi_cell(0, 8, f"{role.title()}: {contact or 'N/A'}")
-    filename = f"lead_{company}_{datetime.datetime.utcnow():%Y%m%d%H%M%S}.pdf"
-    path = f"/mnt/data/{filename}"
+    fname = f"lead_{company}_{datetime.datetime.utcnow():%Y%m%d%H%M%S}.pdf"
+    path = f"/mnt/data/{fname}"
     pdf.output(path)
     return path
-```
