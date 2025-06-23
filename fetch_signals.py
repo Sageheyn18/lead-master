@@ -1,4 +1,4 @@
-# fetch_signals.py — Lead Master v9.0 (2025-06-23)
+# fetch_signals.py — Lead Master v10.0 (2025-06-23)
 
 import os
 import json
@@ -7,8 +7,8 @@ import datetime
 import logging
 import textwrap
 import requests
-import sqlite3
 import csv
+import sqlite3
 import threading
 from collections import defaultdict
 from urllib.parse import quote_plus
@@ -24,199 +24,127 @@ import magic
 from utils import get_conn, ensure_tables
 
 # ───────── CONFIG ─────────
-OPENAI_KEY    = os.getenv("OPENAI_API_KEY", "")
-client        = OpenAI(api_key=OPENAI_KEY)
-geocoder      = Nominatim(user_agent="lead-master")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+client     = OpenAI(api_key=OPENAI_KEY)
+geocoder   = Nominatim(user_agent="lead-master")
 
 # NewsAPI via ENV var
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 if not NEWSAPI_KEY:
-    st.sidebar.warning("⚠️ No NEWSAPI_KEY env var set; national scan will skip NewsAPI.")
+    st.sidebar.warning("⚠️ NEWSAPI_KEY not set; national scan will skip NewsAPI.")
 api = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
 
-MAX_HEADLINES    = 20
-DAILY_BUDGET_CTS = int(os.getenv("DAILY_BUDGET_CENTS","300"))
-BUDGET_USED      = 0
-SUMMARY_THROTTLE = 10
-_LAST_SUMMARY    = 0
-RELEVANCE_CUTOFF = 0.45
+MAX_HEADLINES     = 20
+RELEVANCE_CUTOFF  = 0.45
+SUMMARY_THROTTLE  = 10
+_LAST_SUMMARY     = 0
 
-# National scan keywords
+# Keywords for national scan
 KEYWORDS = [
-    "land purchase","acquired acres","expansion",
-    "construction","facility","plant","warehouse","distribution center"
+    "land purchase", "acquired acres", "expansion",
+    "construction", "facility", "plant",
+    "warehouse", "distribution center"
 ]
-EXTRA_KWS = ["land","acres","site","build","construction","expansion","facility"]
+EXTRA_KWS = [
+    "land", "acres", "site", "build",
+    "construction", "expansion", "facility"
+]
 
-# ───────── SQLITE CACHE ─────────
-_cache = sqlite3.connect("rss_cache.db", check_same_thread=False)
-_cache.execute("PRAGMA journal_mode=WAL;")
-cache_lock = threading.Lock()
-_cache.execute("""
-CREATE TABLE IF NOT EXISTS cache(
-  key   TEXT PRIMARY KEY,
-  data  TEXT,
-  ts    INTEGER
-)""")
-_cache.commit()
-
-def _cached(key, ttl=86400):
-    now = int(time.time())
-    with cache_lock:
-        row = _cache.execute("SELECT data,ts FROM cache WHERE key=?", (key,)).fetchone()
-        if row and now - row[1] < ttl:
-            return json.loads(row[0])
-    return None
-
-def _store(key, data):
-    ts = int(time.time())
-    with cache_lock:
-        _cache.execute(
-            "INSERT OR REPLACE INTO cache(key,data,ts) VALUES(?,?,?)",
-            (key, json.dumps(data), ts)
-        )
-        _cache.commit()
-
-# ───────── BUDGET & CHAT ─────────
-def budget_ok(cost_cents):
-    global BUDGET_USED
-    if BUDGET_USED + cost_cents > DAILY_BUDGET_CTS:
-        logging.warning("GPT daily budget exceeded; skipping call.")
-        return False
-    BUDGET_USED += cost_cents
-    return True
-
-def safe_chat(**params):
-    try:
-        return client.chat.completions.create(**params)
-    except RateLimitError:
-        logging.warning("OpenAI rate-limit reached; skipping call.")
-        return None
+# ───────── DATABASE SETUP ─────────
+def init_db():
+    conn = get_conn()
+    ensure_tables(conn)
+    return conn
 
 # ───────── HELPERS ─────────
 def dedup(rows):
-    seen = set(); out = []
+    seen = set()
+    out  = []
     for r in rows:
         key = (r.get("headline","").lower(), r.get("url","").lower())
-        if key in seen: continue
-        seen.add(key); out.append(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
     return out
 
-def _geo(address):
+def safe_geocode(query):
     try:
-        loc = geocoder.geocode(address, timeout=10)
+        loc = geocoder.geocode(query, timeout=10)
         return loc.latitude, loc.longitude
     except:
         return None, None
 
-def safe_geocode(headline, company):
-    lat, lon = _geo(headline)
-    if lat is None:
-        lat, lon = _geo(f"{company} headquarters")
-    return lat, lon
+def safe_chat(**kwargs):
+    try:
+        return client.chat.completions.create(**kwargs)
+    except RateLimitError:
+        logging.warning("OpenAI rate-limit reached; skipping call.")
+        return None
 
 # ───────── GPT-DRIVEN FUNCTIONS ─────────
-def gpt_signal_info(headline: str):
-    if not budget_ok(7):  # e.g. 7¢ per call
-        return {"company":"Unknown","score":0.0}
-    prompt = (
-        "Extract the company name and relevance score [0–1] as JSON "
-        f'{{"company":<name>,"score":<0-1>}} for this headline:\n"{headline}"'
-    )
-    rsp = safe_chat(
-        model="gpt-3.5-turbo",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0, max_tokens=32
-    )
-    if not rsp:
-        return {"company":"Unknown","score":0.0}
-    try:
-        data = json.loads(rsp.choices[0].message.content)
-        return {"company": data.get("company","Unknown"),
-                "score": float(data.get("score") or 0)}
-    except:
-        return {"company":"Unknown","score":0.0}
-
-def gpt_batch_signal_info(headlines, chunk=10):
-    infos = []
-    for i in range(0, len(headlines), chunk):
-        slice_ = headlines[i:i+chunk]
-        # Batch prompt
-        prompt = "Return JSON list of {headline,company,score} for:\n"
-        prompt += "\n".join(f"- {h}" for h in slice_)
-        rsp = safe_chat(
-            model="gpt-3.5-turbo",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0, max_tokens=256
-        )
-        if rsp:
-            try:
-                items = json.loads(rsp.choices[0].message.content)
-                for itm in items:
-                    itm["score"] = float(itm.get("score",0))
-                infos.extend(items)
-                continue
-            except:
-                pass
-        # Fallback to individual calls
-        for h in slice_:
-            infos.append({"headline":h, **gpt_signal_info(h)})
-    return infos
-
 def gpt_summary(company, headlines):
+    """Return dict with summary, sector, confidence, land_flag."""
     global _LAST_SUMMARY
+    # throttle
     wait = SUMMARY_THROTTLE - (time.time() - _LAST_SUMMARY)
-    if wait>0: time.sleep(wait)
+    if wait > 0:
+        time.sleep(wait)
     _LAST_SUMMARY = time.time()
 
     if not headlines:
         return {"summary":"No signals","sector":"unknown","confidence":0,"land_flag":0}
 
-    if not budget_ok(50):  # e.g. 50¢ for summary
-        return {
-            "summary": headlines[0][:120]+"…",
-            "sector":"unknown","confidence":0,"land_flag":0
-        }
-
-    bullets = "\n".join(f"- {h}" for h in headlines[:10])
     prompt = textwrap.dedent(f"""
         Summarise in 5 bullet points. Guess sector.
         Set land_flag=1 if a land purchase is indicated.
         Return EXACT JSON {{summary,sector,confidence,land_flag}}.
 
         Headlines:
-        {bullets}
+        {"".join("- "+h+"\\n" for h in headlines[:10])}
     """).strip()
 
     rsp = safe_chat(
         model="gpt-4o-mini",
         messages=[{"role":"user","content":prompt}],
-        temperature=0.2, max_tokens=220
+        temperature=0.2,
+        max_tokens=220
     )
     if not rsp:
+        # fallback
         return {
             "summary": headlines[0][:120]+"…",
-            "sector":"unknown","confidence":0,"land_flag":0
+            "sector": "unknown",
+            "confidence": 0,
+            "land_flag": 0
         }
+
     try:
         out = json.loads(rsp.choices[0].message.content)
-        out["confidence"] = float(out.get("confidence",0))
-        out["land_flag"]  = int(out.get("land_flag",0))
+        out["confidence"] = float(out.get("confidence", 0))
+        out["land_flag"]  = int(out.get("land_flag", 0))
         return out
     except:
         return {
             "summary": rsp.choices[0].message.content,
-            "sector":"unknown","confidence":0,"land_flag":0
+            "sector": "unknown",
+            "confidence": 0,
+            "land_flag": 0
         }
 
 # ───────── MANUAL SEARCH ─────────
 def manual_search(company: str):
-    """Lookup headlines for one company, return (summary, headlines, lat, lon)."""
+    """
+    Look up a single company:
+    1) NewsAPI for last 30 days
+    2) Fallback to Google News RSS
+    Returns: (info_dict, headlines_list, lat, lon)
+    """
     today = datetime.date.today()
     since = today - datetime.timedelta(days=30)
+    entries = []
 
     # 1) NewsAPI
-    entries = []
     if api:
         try:
             resp = api.get_everything(
@@ -232,44 +160,132 @@ def manual_search(company: str):
 
     # 2) RSS fallback
     if not entries:
-        rss = feedparser.parse(
+        rss_url = (
             "https://news.google.com/rss/search?"
             f"q={quote_plus(company)}%20when:30d&hl=en-US&gl=US&ceid=US:en"
         )
-        entries = rss.entries
+        feed = feedparser.parse(rss_url)
+        entries = feed.entries
 
-    # Normalize & filter keywords
+    # Normalize & filter by keywords
     raw = []
     for e in entries:
-        title = e.get("title", getattr(e,"title",""))
-        url   = e.get("url",   getattr(e,"link",""))
-        date  = (e.get("publishedAt","")[:10]
-                 or getattr(e,"published","")[:10])
-        raw.append({"headline":title,"url":url,"date":date})
-    # filter by our EXTRA_KWS
-    raw = [r for r in raw if any(kw in r["headline"].lower() for kw in EXTRA_KWS)]
-    unique = dedup(raw)
-    heads  = [u["headline"] for u in unique][:MAX_HEADLINES]
+        title = e.get("title", getattr(e, "title", ""))
+        url   = e.get("link", getattr(e, "url", ""))
+        date  = getattr(e, "published", "")
+        raw.append({"headline": title, "url": url, "date": date})
+
+    filtered = [r for r in raw if any(kw in r["headline"].lower() for kw in EXTRA_KWS)]
+    unique   = dedup(filtered)
+    heads    = [u["headline"] for u in unique][:MAX_HEADLINES]
 
     if not heads:
         return None, [], None, None
 
     info = gpt_summary(company, heads)
-    lat, lon = safe_geocode("", company)
+    lat, lon = safe_geocode(company + " headquarters")
     return info, heads, lat, lon
 
-# ───────── CONTACTS & LOGO ─────────
+# ───────── NATIONAL SCAN ─────────
+def national_scan():
+    """Run a 30-day national scan, show sidebar diagnostics, save to DB."""
+    conn    = init_db()
+    sidebar = st.sidebar
+    sidebar.header("National Scan Progress")
+
+    today = datetime.date.today()
+    since = today - datetime.timedelta(days=30)
+    all_hits = []
+
+    for idx, kw in enumerate(KEYWORDS, start=1):
+        sidebar.write(f"[{idx}/{len(KEYWORDS)}] {kw}")
+        hits = []
+
+        # NewsAPI
+        if api:
+            try:
+                resp = api.get_everything(
+                    q=kw,
+                    from_param=since.isoformat(),
+                    to=today.isoformat(),
+                    language="en",
+                    sort_by="relevancy",
+                    page_size=100
+                )
+                hits = resp.get("articles", [])
+                sidebar.write(f" • NewsAPI: {len(hits)}")
+            except:
+                hits = []
+
+        # RSS fallback
+        if not hits:
+            rss_url = (
+                "https://news.google.com/rss/search?"
+                f"q={quote_plus(kw)}%20when:30d&hl=en-US&gl=US&ceid=US:en"
+            )
+            feed = feedparser.parse(rss_url)
+            hits = feed.entries
+            sidebar.write(f" • RSS: {len(hits)}")
+
+        # Normalize & dedupe
+        norm = []
+        for e in hits:
+            title = e.get("title", getattr(e, "title", ""))
+            url   = e.get("link", getattr(e, "url", ""))
+            date  = getattr(e, "published", "")[:10]
+            norm.append({"headline": title, "url": url, "date": date})
+
+        uniq = dedup(norm)
+        sidebar.write(f" • Deduped: {len(uniq)}")
+        all_hits.extend(uniq)
+        sidebar.progress(idx / len(KEYWORDS))
+
+    # Score & group
+    sidebar.write("📝 Scoring…")
+    # batch via GPT for company+score
+    infos = []
+    for h in all_hits:
+        infos.append(gpt_summary(h["headline"], [h["headline"]]))
+
+    by_co = defaultdict(list)
+    for hit, info in zip(all_hits, infos):
+        score = info.get("confidence", 0)
+        if score >= RELEVANCE_CUTOFF:
+            hit.update(info)
+            by_co[info.get("sector","Unknown")].append(hit)
+
+    # Save to DB
+    sidebar.write("💾 Saving…")
+    for co, items in by_co.items():
+        heads = [it["headline"] for it in items]
+        summary = gpt_summary(co, heads)
+        lat, lon = safe_geocode(co + " headquarters")
+
+        conn.execute(
+            "INSERT OR IGNORE INTO clients"
+            "(name,summary,sector_tags,status,lat,lon) VALUES(?,?,?,?,?,?)",
+            (co, summary["summary"], json.dumps([summary["sector"]]), "New", lat, lon)
+        )
+        for it in items:
+            conn.execute(
+                "INSERT OR IGNORE INTO signals"
+                "(company,headline,url,date) VALUES(?,?,?,?)",
+                (co, it["headline"], it["url"], it["date"])
+            )
+    conn.commit()
+    sidebar.success("✅ Scan complete!")
+
+# ───────── CONTACTS ─────────
 def company_contacts(company: str):
+    """Return list of {name,title,email,phone}."""
     prompt = (
-        f"List up to 3 procurement, engineering, or construction "
-        f"contacts at {company} as JSON array of "
-        '{"name", "title", "email", "phone"}.'
+        f"List up to 3 procurement/engineering/construction contacts "
+        f"for {company} as JSON array of {{name,title,email,phone}}."
     )
     rsp = safe_chat(
         model="gpt-3.5-turbo",
         messages=[{"role":"user","content":prompt}],
-        temperature=0,
-        max_tokens=256
+        temperature=0, max_tokens=256
     )
     if not rsp:
         return []
@@ -278,8 +294,9 @@ def company_contacts(company: str):
     except:
         return []
 
+# ───────── LOGO FETCH ─────────
 def fetch_logo(company: str):
-    """Fetch company logo via Clearbit if possible."""
+    """Fetch a logo via Clearbit."""
     domain = company.replace(" ", "") + ".com"
     try:
         r = requests.get(f"https://logo.clearbit.com/{domain}", timeout=5)
@@ -291,12 +308,16 @@ def fetch_logo(company: str):
 
 # ───────── PDF EXPORT ─────────
 def export_pdf(row, summary_text, contacts):
+    """
+    Build a PDF: logo, company name, summary bullets, contacts, footer.
+    Returns raw PDF bytes.
+    """
     pdf = FPDF()
     pdf.set_auto_page_break(True, 15)
     pdf.add_page()
 
     # Logo
-    logo = fetch_logo(row["company"])
+    logo = fetch_logo(row.get("company",""))
     if logo:
         ext = magic.from_buffer(logo, mime=True).split("/")[-1]
         fn = f"/tmp/logo.{ext}"
@@ -304,17 +325,16 @@ def export_pdf(row, summary_text, contacts):
         pdf.image(fn, x=10, y=10, w=20)
         pdf.set_xy(35, 10)
 
-    # Headline or title
-    txt = row.get("headline", row.get("company", ""))
+    # Title
     pdf.set_font("Helvetica","B",16)
-    pdf.multi_cell(0, 10, txt)
+    pdf.multi_cell(0,10, row.get("company",""))
     pdf.ln(5)
 
-    # Summary bullets
+    # Summary
     pdf.set_font("Helvetica","",12)
-    for bullet in summary_text.split("\n"):
-        if bullet.strip():
-            pdf.multi_cell(0, 7, "• " + bullet.strip())
+    for line in summary_text.split("\n"):
+        if line.strip():
+            pdf.multi_cell(0,7, "• "+line.strip())
     pdf.ln(3)
 
     # Contacts
@@ -335,21 +355,24 @@ def export_pdf(row, summary_text, contacts):
     pdf.set_font("Helvetica","I",9)
     pdf.multi_cell(
         0,5,
-        f"Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}\n"
-        f"Source URL: {row.get('url','')}"
+        f"Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}"
     )
 
     return pdf.output(dest="S").encode("latin-1")
 
-# ───────── PERMITS ─────────
+# ───────── PERMITS CSV ─────────
 def fetch_permits():
+    """
+    Read permits.csv and return list of dicts with company, address, date, type, details_url, lat, lon.
+    """
     path = "permits.csv"
     if not os.path.exists(path):
         return []
     out = []
     with open(path, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            lat, lon = safe_geocode(r.get("address",""), r.get("company",""))
+        reader = csv.DictReader(f)
+        for r in reader:
+            lat, lon = safe_geocode(r.get("address",""))
             out.append({
                 "company":    r.get("company",""),
                 "address":    r.get("address",""),
@@ -360,42 +383,3 @@ def fetch_permits():
                 "lon":        lon
             })
     return out
-
-# ───────── SIGNAL WRITER & NATIONAL SCAN ─────────
-def write_signals(rows, conn):
-    for r in rows:
-        conn.execute(
-            "INSERT OR REPLACE INTO signals "
-            "(company,headline,url,date,source_label,land_flag,sector_guess,lat,lon) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                r["company"], r["headline"], r["url"], r["date"],
-                r.get("src","scan"), r.get("land_flag",0),
-                r.get("sector",""), r.get("lat"), r.get("lon")
-            )
-        )
-    conn.commit()
-
-def national_scan():
-    conn = get_conn()
-    ensure_tables(conn)
-
-    sidebar = st.sidebar
-    sidebar.header("National Scan Progress")
-
-    today = datetime.date.today()
-    since = today - datetime.timedelta(days=30)
-    all_prospects = []
-
-    for idx, kw in enumerate(KEYWORDS, 1):
-        sidebar.write(f"🔑 [{idx}/{len(KEYWORDS)}] {kw}")
-
-        # 1) NewsAPI
-        entries = []
-        if api:
-            try:
-                resp = api.get_everything(
-                    q=kw,
-                    from_param=since.isoformat(),
-                    to=today.isoformat(),
-                    language="en",
