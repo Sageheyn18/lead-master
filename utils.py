@@ -1,42 +1,50 @@
-# utils.py — SQLite helpers
-
 import sqlite3
+from pathlib import Path
 
-DB_PATH = "lead_master.db"
+DB_PATH = Path(__file__).parent / "data" / "lead_master.db"
+PERMITS_CSV = Path(__file__).parent / "data" / "permits.csv"
 
 def get_conn():
-    """Return a SQLite connection (thread‐safe)."""
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
 
-def ensure_tables(conn):
-    """Create clients, signals, and pipeline tables if they don’t exist."""
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS clients (
-        name        TEXT PRIMARY KEY,
-        summary     TEXT,
+def ensure_tables():
+    conn = get_conn()
+    c = conn.cursor()
+    # Clients table
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+        name TEXT PRIMARY KEY,
+        summary TEXT,
         sector_tags TEXT,
-        status      TEXT,
-        lat         REAL,
-        lon         REAL
-      )
+        status TEXT,
+        lat REAL,
+        lon REAL,
+        contacts TEXT
+    )
     """)
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS signals (
-        company   TEXT,
-        headline  TEXT,
-        url       TEXT,
-        date      TEXT,
-        lat       REAL,
-        lon       REAL,
-        PRIMARY KEY(company, headline)
-      )
+    # Signals table (national scan & manual cache)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company TEXT,
+        headline TEXT,
+        url TEXT,
+        date TEXT,
+        score REAL,
+        read INTEGER DEFAULT 0
+    )
     """)
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS pipeline (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        company   TEXT,
-        headline  TEXT,
-        status    TEXT
-      )
+    # Raw-cache for manual scan
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS raw_cache (
+        seed TEXT,
+        fetched TIMESTAMP,
+        headline TEXT,
+        url TEXT,
+        date TEXT,
+        PRIMARY KEY(seed, headline)
+    )
     """)
     conn.commit()
+    conn.close()
