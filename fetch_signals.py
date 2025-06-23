@@ -1,3 +1,4 @@
+```python
 # fetch_signals.py
 import os
 import logging
@@ -70,8 +71,8 @@ def manual_search(company: str):
     # 2) Summarize via GPT
     if raw:
         prompt = (
-            f"Summarize these headlines for {company}, focusing on land purchases or construction leads:
-"            + "\n".join(f"- {r['headline']}" for r in raw)
+            f"Summarize these headlines for {company}, focusing on land purchases or construction leads:\n"
+            + "\n".join(f"- {r['headline']}" for r in raw)
         )
         rsp = safe_chat(
             model="gpt-4o-mini",
@@ -110,7 +111,8 @@ def national_scan():
         seen = set(); dedup = []
         for h in hits:
             key = (h.title.lower(), h.link.lower())
-            if key in seen: continue
+            if key in seen:
+                continue
             seen.add(key)
             dedup.append({
                 "headline": h.title,
@@ -132,7 +134,8 @@ def national_scan():
             temperature=0.2,
             max_tokens=50,
         )
-        if not info: continue
+        if not info:
+            continue
         try:
             parsed = json.loads(info.choices[0].message.content)
             co = parsed.get("company")
@@ -211,3 +214,4 @@ def export_pdf(company: str, headline: str, contacts: dict):
     path = f"/mnt/data/{filename}"
     pdf.output(path)
     return path
+```
