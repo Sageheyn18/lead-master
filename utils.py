@@ -1,48 +1,42 @@
-# utils.py
-import os, sqlite3
+# utils.py — SQLite helpers
 
-DB_PATH = os.path.join(os.getcwd(), "leadmaster.db")
+import sqlite3
+
+DB_PATH = "lead_master.db"
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    return conn
+    """Return a SQLite connection (thread‐safe)."""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def ensure_tables(conn):
-    # Clients with HQ lat/lon
+    """Create clients, signals, and pipeline tables if they don’t exist."""
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS clients(
-      name TEXT PRIMARY KEY,
-      summary TEXT,
-      sector_tags TEXT,
-      status TEXT,
-      lat REAL,
-      lon REAL
-    )
+      CREATE TABLE IF NOT EXISTS clients (
+        name        TEXT PRIMARY KEY,
+        summary     TEXT,
+        sector_tags TEXT,
+        status      TEXT,
+        lat         REAL,
+        lon         REAL
+      )
     """)
-    # Signals (individual headlines)
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS signals(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      company TEXT,
-      date TEXT,
-      headline TEXT,
-      url TEXT,
-      source_label TEXT,
-      land_flag INTEGER,
-      sector_guess TEXT,
-      lat REAL,
-      lon REAL
-    )
+      CREATE TABLE IF NOT EXISTS signals (
+        company   TEXT,
+        headline  TEXT,
+        url       TEXT,
+        date      TEXT,
+        lat       REAL,
+        lon       REAL,
+        PRIMARY KEY(company, headline)
+      )
     """)
-    # Contacts
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS contacts(
-      company TEXT,
-      name TEXT,
-      title TEXT,
-      email TEXT,
-      phone TEXT,
-      UNIQUE(company,name,title,email)
-    )
+      CREATE TABLE IF NOT EXISTS pipeline (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        company   TEXT,
+        headline  TEXT,
+        status    TEXT
+      )
     """)
     conn.commit()
