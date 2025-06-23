@@ -1,90 +1,140 @@
-# app.py — Lead Master UI v12.0
-
-import streamlit as st
-import folium
-import pandas as pd
+# app.py
+import datetime
 import json
 
+import pandas as pd
+import streamlit as st
+import folium
 from streamlit_folium import st_folium
+
 from utils import get_conn, ensure_tables
 from fetch_signals import (
-    client,
     manual_search,
     national_scan,
-    export_pdf,
     company_contacts,
     fetch_logo,
     gpt_summary,
-    fetch_permits
 )
 
-st.set_page_config(page_title="Lead Master", layout="wide")
+# ───────── page config ─────────
+st.set_page_config(page_title="Lead Master", layout="wide", initial_sidebar_state="expanded")
 
-# ───────── SIDEBAR: Manual Search ─────────
-st.sidebar.header("Search Company")
-overlay_input = st.sidebar.text_input("Name")
-if st.sidebar.button("Go", key="go"):
-    st.session_state["overlay"] = overlay_input
-
-# ───────── SIDEBAR: National Scan ─────────
-if st.sidebar.button("Run national scan now"):
-    with st.spinner("Scanning…"):
-        national_scan()
-    # Streamlit will auto‐rerun and show the sidebar success message
-
-# ───────── MAIN RENDER ─────────
+# ensure our SQLite tables exist
 conn = get_conn()
 ensure_tables(conn)
-clients = pd.read_sql("SELECT * FROM clients", conn)
 
-if "overlay" in st.session_state:
-    company = st.session_state["overlay"]
+# ───────── session state defaults ─────────
+if "overlay" not in st.session_state:
+    st.session_state.overlay = None
+if "page" not in st.session_state:
+    st.session_state.page = "Map"
+
+# ───────── sidebar ─────────
+with st.sidebar:
+    st.title("Search Company")
+    co = st.text_input("Name", key="search_co")
+    if st.button("Go", key="go"):
+        st.session_state.overlay = co.strip()
+    if st.session_state.overlay:
+        if st.button("Back to map", key="back"):
+            st.session_state.overlay = None
+
+    st.markdown("---")
+    if st.button("Run national scan now"):
+        with st.spinner("Scanning… this can take a minute…"):
+            national_scan()
+        st.experimental_rerun()
+
+    heat = st.checkbox("Heatmap overlay")
+    st.markdown("---")
+    st.subheader("View")
+    page = st.selectbox("", ["Map", "Companies", "Pipeline"], index=["Map", "Companies", "Pipeline"].index(st.session_state.page))
+    st.session_state.page = page
+
+# ───────── search overlay ─────────
+if st.session_state.overlay:
+    company = st.session_state.overlay
     info, rows, lat, lon = manual_search(company)
     st.title(f"{company} — Overview")
-    st.write("**Summary:**", info["summary"])
-    st.write(f"**Sector:** {info['sector']} — **Confidence:** {info['confidence']}")
-    st.write(f"**Land Flag:** {info['land_flag']}")
-    # Details
-    st.subheader("Signals")
-    for r in rows:
-        with st.expander(r["headline"]):
-            st.write("•", r["summary"])
-            st.write("[View article]("+r["url"]+")")
-            if st.button(f"Save to {company}", key=r["headline"]):
+    st.subheader("Executive summary")
+    for bullet in info["summary"].split("•"):
+        b = bullet.strip()
+        if b:
+            st.write("• " + b)
+    st.write(f"**Sector:** {info['sector']}  •  **Confidence:** {info['confidence']:.2f}")
+    st.subheader("Headlines (tick to save)")
+    sel = st.multiselect("Select which headlines to add", [r["headline"] for r in rows])
+    tag = st.selectbox("Sector tag", ["Manufacturing","Industrial","Retail","Logistics","Energy","Other"])
+    if st.button("Save selected"):
+        for h in rows:
+            if h["headline"] in sel:
                 conn.execute(
                     "INSERT OR REPLACE INTO signals(company,headline,url,date) VALUES(?,?,?,?)",
-                    (company, r["headline"], r["url"], r["date"])
+                    (company, h["headline"], h["url"], h["date"])
                 )
-                conn.commit()
-    if st.button("Back to map"):
-        del st.session_state["overlay"]
+        conn.commit()
+        st.success("Saved!")
+    st.stop()
 
-else:
-    # Map view of all clients
+# ───────── Map page ─────────
+if page == "Map":
     st.title("Lead Master — Project Map")
-    df = clients.dropna(subset=["lat","lon"])
-    m  = folium.Map(location=[37,-96], zoom_start=4, tiles="CartoDB Positron")
+    clients = pd.read_sql("SELECT * FROM clients", conn)
+    signals = pd.read_sql("SELECT company,lat,lon,date FROM signals WHERE date>=date('now','-5 months')", conn)
+    df = clients.merge(
+        signals.groupby("company").first().reset_index(),
+        on="company", how="inner"
+    )
+
+    m = folium.Map(location=[37, -96], zoom_start=4, tiles="CartoDB Positron")
+    if heat and not df.empty:
+        from folium.plugins import HeatMap
+        pts = df[["lat","lon"]].dropna().values.tolist()
+        HeatMap(pts).add_to(m)
+
     for _, r in df.iterrows():
-        folium.Marker([r.lat, r.lon], popup=r.name).add_to(m)
+        folium.Marker(
+            [r["lat"], r["lon"]],
+            popup=(
+                f"<b>{r['company']}</b><br>"
+                f"{r['summary'][:120]}…<br>"
+                f"<a href='{r['url']}' target='_blank'>Read more</a>"
+            )
+        ).add_to(m)
+
     st_folium(m, width=700, height=500)
 
-    st.sidebar.header("Companies")
-    choice = st.sidebar.selectbox("View company", clients["name"].tolist())
-    if choice:
-        info = clients[clients.name==choice].iloc[0]
-        st.sidebar.subheader(choice)
-        st.sidebar.write(info.summary)
-        if st.sidebar.button("Export PDF"):
-            contacts = company_contacts(choice)
-            pdfdata  = export_pdf(info, info.summary, contacts)
-            st.sidebar.download_button(
-                "Download Proposal PDF", data=pdfdata,
-                file_name=f"{choice}-proposal.pdf", mime="application/pdf"
-            )
+# ───────── Companies page ─────────
+elif page == "Companies":
+    st.title("Companies")
+    clients = pd.read_sql("SELECT * FROM clients", conn)
+    if clients.empty:
+        st.info("No companies yet.")
+    else:
+        for _, c in clients.iterrows():
+            logo = fetch_logo(c["company"])
+            cols = st.columns([1,3,1])
+            with cols[0]:
+                if logo: st.image(logo, width=60)
+            with cols[1]:
+                st.subheader(c["company"])
+                st.write(c["summary"])
+                st.write("• Sector:", ", ".join(json.loads(c["sector_tags"])))
+            with cols[2]:
+                if st.button("View details", key=f"view_{c['company']}"):
+                    st.session_state.overlay = c["company"]
+                    st.session_state.page = "Map"
+                    st.experimental_rerun()
 
-# ───────── PERMITS ─────────
-permits = fetch_permits()
-if permits:
-    st.sidebar.header("Recent Permits")
-    for p in permits:
-        st.sidebar.write(f"{p['date']} — {p['company']} — {p['type']}")
+# ───────── Pipeline page ─────────
+elif page == "Pipeline":
+    st.title("Pipeline")
+    pipeline = pd.read_sql("SELECT * FROM pipeline", conn)
+    if pipeline.empty:
+        st.info("No pipeline entries yet.")
+    else:
+        st.dataframe(pipeline)
+
+# ───────── utilities ─────────
+st.markdown("---")
+st.caption("© Sage's Lead Master")
