@@ -1,4 +1,4 @@
-# app.py — Lead Master v3.3 (2025-06-23)
+# app.py — Lead Master v3.4 (2025-06-23)
 
 import os
 import json
@@ -48,7 +48,7 @@ if st.sidebar.button("Back to map"):
     st.session_state.pop("overlay", None)
     st.experimental_rerun()
 
-# Search company input (collapsed label to avoid warning)
+# Search company input (collapsed label)
 overlay_input = st.sidebar.text_input(
     "Search company", key="overlay_input", label_visibility="collapsed"
 )
@@ -56,12 +56,11 @@ if st.sidebar.button("Go", key="go"):
     st.session_state["overlay"] = overlay_input
     st.experimental_rerun()
 
-# GPT spend display
+# Display GPT spend with write (no hidden widget)
 spent = getattr(client.usage.today(), "total_cents", 0)
-st.sidebar.markdown(f"GPT spend: {spent}¢ / 300¢")
+st.sidebar.write(f"GPT spend: {spent}¢ / 300¢")
 
 # ───────── Page Selector ─────────
-# We bind directly to session_state["page"], no manual re-assignment below
 page = st.sidebar.radio(
     "Pages",
     ["Map", "Companies", "Pipeline", "Permits"],
@@ -77,7 +76,7 @@ ensure_tables(conn)
 if page == "Map":
     st.title("Lead Master — Project Map")
 
-    # If overlay active → company lookup
+    # Overlay search
     if overlay := st.session_state.get("overlay"):
         info, heads, lat, lon = manual_search(overlay)
         if info:
@@ -111,7 +110,7 @@ if page == "Map":
             st.experimental_rerun()
         st.stop()
 
-    # Otherwise draw the map
+    # Draw the map
     clients = pd.read_sql("SELECT * FROM clients", conn)
     m = folium.Map(location=[37, -96], zoom_start=4, tiles="CartoDB Positron")
 
@@ -150,7 +149,6 @@ elif page == "Companies":
         st.write(f"**Status:** {row['status']}")
         st.write(f"**Location:** {row['lat']}, {row['lon']}")
 
-        # Contacts section
         contacts = pd.read_sql(
             "SELECT * FROM contacts WHERE company=?", 
             conn, params=(sel,)
@@ -165,11 +163,7 @@ elif page == "Companies":
 
         if st.button("Export profile PDF"):
             pdf_data = export_pdf(
-                {
-                    "company": sel,
-                    "headline": "",
-                    "url": ""
-                },
+                {"company": sel, "headline": "", "url": ""},
                 row["summary"],
                 contacts.to_dict("records")
             )
@@ -194,4 +188,3 @@ elif page == "Permits":
 
 else:
     st.error("Unknown page!")
-
