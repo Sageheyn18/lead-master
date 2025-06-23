@@ -1,28 +1,25 @@
-# fetch_signals.py
-import os
 import logging
-import datetime
 import json
-from collections import defaultdict
 from urllib.parse import quote_plus
+import datetime
 
 import streamlit as st
-import feedparser
 from geopy.geocoders import Nominatim
 from openai import OpenAI, OpenAIError
-from fpdf import FPDF
 
-from utils import get_conn, ensure_tables
+from utils import get_conn
 
-# ───────── OpenAI Client ─────────
-api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+# ───────── OpenAI client via Streamlit secrets ─────────
+api_key = (
+    st.secrets.get("OPENAI_API_KEY") or
+    st.secrets.get("OPENAI", {}).get("api_key")
+)
 if not api_key:
     st.error(
-        "❌ OpenAI API key not found. Set OPENAI_API_KEY environment variable,"
-        " or add OPENAI_API_KEY to .streamlit/secrets.toml under [default]."
+        "❌ **OpenAI API key not found!**\n"
+        "Add OPENAI_API_KEY to .streamlit/secrets.toml"
     )
     st.stop()
-
 client = OpenAI(api_key=api_key)
 
 # ───────── Constants ─────────
@@ -30,175 +27,133 @@ SEED_KWS = [
     "land purchase", "acquired site", "build", "construction",
     "expansion", "facility", "plant", "warehouse", "distribution center"
 ]
-MAX_HEADLINES = 60  # limit results for performance
+MAX_HEADLINES = 60
 
 # ───────── Helpers ─────────
 def safe_chat(**kwargs):
-    """Call OpenAI and skip errors."""
     try:
         return client.chat.completions.create(**kwargs)
     except OpenAIError as e:
-        logging.warning(f"OpenAI error: {e}")
+        logging.warning(f"OpenAI error: {e!r}")
         return None
 
 
 def rss_search(query: str, days: int = 30, maxrec: int = MAX_HEADLINES):
-    """Fetch Google News RSS for the past `days` days."""
     q = quote_plus(f"{query} when:{days}d")
     url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    import feedparser
     feed = feedparser.parse(url)
-    return feed.entries[:maxrec]
-
-# ───────── Manual Search ─────────
-def manual_search(company: str):
-    """Lookup a single company: RSS → summarize → geocode."""
-    # Fetch headlines
-    raw = []
-    for entry in rss_search(company, days=150):
-        raw.append({
-            "headline": entry.title,
-            "url": entry.link,
-            "date": getattr(entry, "published", None),
+    entries = []
+    for e in feed.entries[:maxrec]:
+        entries.append({
+            "headline": e.title,
+            "url": e.link,
+            "date": getattr(e, "published", None)
         })
+    return entries
 
-    # Summarize via GPT
-    if raw:
-        prompt = (
-            f"Summarize these headlines for {company}, focusing on land purchases or construction leads:\n"
-            + "\n".join(f"- {r['headline']}" for r in raw)
-        )
-        rsp = safe_chat(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=200,
-        )
-        summary = rsp.choices[0].message.content.strip() if rsp else ""
-    else:
-        summary = "No recent headlines found."
-
-    # Geocode
-    locator = Nominatim(user_agent="lead_master_app")
+# ───────── Manual search ─────────
+def manual_search(company: str):
+    # fetch recent headlines
+    raw = rss_search(company)
+    # summarize via GPT
+    prompt = (
+        f"Summarize these headlines for {company} focusing on potential construction leads."
+        " Return JSON with keys: summary (array of bullets), sector (string), confidence (0-1). Headlines:\n" +
+        "\n".join(f"- {h['headline']}" for h in raw[:MAX_HEADLINES])
+    )
+    rsp = safe_chat(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=200,
+    )
+    summary = {"summary": [], "sector": "unknown", "confidence": 0.0}
+    if rsp:
+        try:
+            content = rsp.choices[0].message.content
+            parsed = json.loads(content)
+            summary.update(parsed)
+        except Exception:
+            pass
+    # geocode
+    locator = Nominatim(user_agent="lead_master")
     loc = locator.geocode(company, timeout=10)
     lat, lon = (loc.latitude, loc.longitude) if loc else (None, None)
-
     return summary, raw, lat, lon
 
-# ───────── National Scan ─────────
+# ───────── National scan ─────────
 def national_scan():
-    """Fetch, dedupe, score, group by company, and save to SQLite."""
     conn = get_conn()
-    ensure_tables()
     sidebar = st.sidebar
     sidebar.info("🔍 Running national scan…")
-    progress = sidebar.progress(0)
+    prog = sidebar.progress(0)
     all_hits = []
-
-    # 1) Fetch and dedupe
+    # fetch & dedupe
     for i, kw in enumerate(SEED_KWS, start=1):
-        sidebar.write(f"[{i}/{len(SEED_KWS)}] Searching '{kw}'…")
+        sidebar.write(f"[{i}/{len(SEED_KWS)}] {kw}")
         hits = rss_search(kw)
-        seen, deduped = set(), []
+        seen = set()
+        dedup = []
         for h in hits:
-            key = (h.title.lower(), h.link.lower())
+            key = (h["headline"].lower(), h["url"].lower())
             if key in seen: continue
             seen.add(key)
-            deduped.append({
-                "headline": h.title,
-                "url": h.link,
-                "date": getattr(h, "published", None),
-            })
-        all_hits.extend(deduped)
-        progress.progress(i / len(SEED_KWS))
-
-    # 2) Score each via GPT
-    sidebar.info("✍️ Scoring headlines…")
+            h["seed"] = kw
+            dedup.append(h)
+        all_hits.extend(dedup)
+        prog.progress(i/len(SEED_KWS))
+    # score & group
     scored = []
     for hit in all_hits[:MAX_HEADLINES]:
         info = safe_chat(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content":
-                f"Extract company name and confidence (0–1) from this headline:\n{hit['headline']}"
-            }],
+            messages=[{"role": "user",
+                       "content":
+                       f"Extract company and confidence from this headline as JSON: {hit['headline']}"}],
             temperature=0.2,
-            max_tokens=50,
+            max_tokens=50
         )
         if not info: continue
         try:
             parsed = json.loads(info.choices[0].message.content)
-            co = parsed.get("company")
-            conf = float(parsed.get("confidence", 0))
-            if co and conf >= 0.3:
-                hit["company"] = co
-                hit["confidence"] = conf
-                scored.append(hit)
+            hit.update(parsed)
+            scored.append(hit)
         except Exception:
             continue
-
-    # 3) Group by company and save
+    # write to DB
+    from collections import defaultdict
     by_co = defaultdict(list)
     for s in scored:
-        by_co[s["company"]].append(s)
-
-    for co, projects in by_co.items():
-        proj = projects[0]
-        locator = Nominatim(user_agent="lead_master_app")
+        co = s.get("company")
+        if co: by_co[co].append(s)
+    for co, items in by_co.items():
+        first = items[0]
+        # geocode company
+        locator = Nominatim(user_agent="lead_master")
         loc = locator.geocode(co, timeout=10)
         lat, lon = (loc.latitude, loc.longitude) if loc else (None, None)
-
-        # Upsert client
+        # upsert client
         conn.execute(
-            """
-            INSERT OR REPLACE INTO clients
-              (name, summary, sector_tags, status, lat, lon)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                co,
-                proj.get("headline", ""),
-                json.dumps([p.get("headline") for p in projects]),
-                "New",
-                lat,
-                lon,
-            ),
+            "INSERT OR REPLACE INTO clients (name, summary, sector_tags, status, lat, lon)"
+            " VALUES (?,?,?,?,?,?)",
+            (co, "", json.dumps([first['seed']]), 'New', lat, lon)
         )
-        # Insert signals
-        for p in projects:
+        # insert signals
+        for rec in items:
             conn.execute(
-                """
-                INSERT OR REPLACE INTO signals
-                  (company, headline, url, date, lat, lon)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    co,
-                    p["headline"],
-                    p["url"],
-                    p.get("date"),
-                    lat,
-                    lon,
-                ),
+                "INSERT OR REPLACE INTO signals (company, headline, url, date, lat, lon)"
+                " VALUES (?,?,?,?,?,?)",
+                (co, rec['headline'], rec['url'], rec.get('date'), lat, lon)
             )
     conn.commit()
-    sidebar.success("✅ National scan complete!")
+    sidebar.success("✅ Scan complete!")
 
-# ───────── Company Contacts ─────────
+# ───────── Contacts & PDF ─────────
 def company_contacts(company: str):
-    """Stub for procurement/engineering contacts lookup."""
-    return {"procurement": None, "engineering": None, "construction": None}
+    return {"procurement": None, "facilities": None}
 
-# ───────── Export PDF ─────────
 def export_pdf(company: str, headline: str, contacts: dict):
-    """Generate a one-page PDF executive summary."""
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, f"Executive Summary: {company}", ln=True)
-    pdf.set_font("Arial", "", 12)
-    pdf.multi_cell(0, 8, f"Headline: {headline}")
-    for role, contact in contacts.items():
-        pdf.multi_cell(0, 8, f"{role.title()}: {contact or 'N/A'}")
-    fname = f"lead_{company}_{datetime.datetime.utcnow():%Y%m%d%H%M%S}.pdf"
-    path = f"/mnt/data/{fname}"
-    pdf.output(path)
-    return path
+    # stub: return a fake path
+    out = Path('.').resolve() / f"{company[:10]}_report.pdf"
+    return str(out)
