@@ -1,12 +1,11 @@
-streamlit>=1.26
-streamlit-folium
-streamlit-aggrid
+streamlit
 pandas
 folium
+streamlit-folium
+geopy
 openai
 fpdf
 python-magic
+newsapi-python
 feedparser
-geopy
-Pillow
 requests
