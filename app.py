@@ -1,4 +1,4 @@
-# app.py — Lead Master v3.2 (updated 2025-06-23)
+# app.py — Lead Master v3.3 (2025-06-23)
 
 import os
 import json
@@ -38,63 +38,59 @@ if theme == "Dark":
 if st.sidebar.button("Run national scan now"):
     with st.spinner("Scanning…"):
         national_scan()
-    # force a rerun so new data appears:
     st.experimental_rerun()
 
 # Heatmap toggle
 heatmap_on = st.sidebar.checkbox("Heatmap overlay", value=False)
 
-# Back‐to‐map button (when not already on Map)
+# Back-to-map button
 if st.sidebar.button("Back to map"):
-    st.session_state["page"] = "Map"
-
-# Page selector
-menu = st.sidebar.expander("Menu", expanded=True)
-with menu:
-    page = st.radio(
-        "", 
-        ["Map", "Companies", "Pipeline", "Permits"],
-        index=["Map","Companies","Pipeline","Permits"]
-        .index(st.session_state.get("page", "Map")),
-        key="page"
-    )
-st.session_state["page"] = page
-
-# Search company input (collapsed label to avoid warnings)
-search_co = st.sidebar.text_input(
-    "Search company", 
-    key="search_co", 
-    label_visibility="collapsed"
-)
-if st.sidebar.button("Go", key="go"):
-    st.session_state["overlay"] = search_co
+    st.session_state.pop("overlay", None)
     st.experimental_rerun()
 
-# Show current GPT spend
-spent = client.usage.today().get("total_cents", 0)
+# Search company input (collapsed label to avoid warning)
+overlay_input = st.sidebar.text_input(
+    "Search company", key="overlay_input", label_visibility="collapsed"
+)
+if st.sidebar.button("Go", key="go"):
+    st.session_state["overlay"] = overlay_input
+    st.experimental_rerun()
+
+# GPT spend display
+spent = getattr(client.usage.today(), "total_cents", 0)
 st.sidebar.markdown(f"GPT spend: {spent}¢ / 300¢")
 
-# ───────── Main Area ─────────
+# ───────── Page Selector ─────────
+# We bind directly to session_state["page"], no manual re-assignment below
+page = st.sidebar.radio(
+    "Pages",
+    ["Map", "Companies", "Pipeline", "Permits"],
+    index=["Map", "Companies", "Pipeline", "Permits"]
+          .index(st.session_state.get("page", "Map")),
+    key="page"
+)
+
+# ───────── Main Content ─────────
 conn = get_conn()
 ensure_tables(conn)
 
-if st.session_state["page"] == "Map":
+if page == "Map":
     st.title("Lead Master — Project Map")
 
-    # If an overlay search is active
+    # If overlay active → company lookup
     if overlay := st.session_state.get("overlay"):
         info, heads, lat, lon = manual_search(overlay)
         if info:
             st.subheader(overlay)
-            for b in info["summary"].split("\n"):
-                if b.strip():
-                    st.write("• " + b.strip())
+            for line in info["summary"].split("\n"):
+                if line.strip():
+                    st.write("• " + line.strip())
             st.write(f"**Sector:** {info['sector']}  •  "
                      f"**Confidence:** {info['confidence']}")
             if st.button("Save to library"):
-                # Insert as a new client
                 conn.execute(
-                    "INSERT OR IGNORE INTO clients(name,summary,sector_tags,status,lat,lon) "
+                    "INSERT OR IGNORE INTO clients "
+                    "(name,summary,sector_tags,status,lat,lon) "
                     "VALUES(?,?,?,?,?,?)",
                     (
                         overlay,
@@ -110,71 +106,86 @@ if st.session_state["page"] == "Map":
         else:
             st.info("No signals found for that company.")
 
-        if st.button("Close", key="close_overlay"):
-            del st.session_state["overlay"]
+        if st.button("Close"):
+            st.session_state.pop("overlay", None)
             st.experimental_rerun()
         st.stop()
 
-    # Otherwise show the full map
+    # Otherwise draw the map
     clients = pd.read_sql("SELECT * FROM clients", conn)
-    # Apply heatmap or markers
     m = folium.Map(location=[37, -96], zoom_start=4, tiles="CartoDB Positron")
+
     if heatmap_on and not clients.empty:
-        pts = clients[["lat","lon"]].dropna().values.tolist()
+        pts = clients[["lat", "lon"]].dropna().values.tolist()
         folium.plugins.HeatMap(pts).add_to(m)
 
     for _, r in clients.iterrows():
-        # >>> FIX: use bracket access instead of attribute <<<
-        if r["lat"] is None or r["lon"] is None:
+        if pd.isna(r["lat"]) or pd.isna(r["lon"]):
             continue
         folium.Marker(
             [r["lat"], r["lon"]],
             popup=(
                 f"<b>{r['name']}</b><br>"
                 f"{r['summary'][:120]}…<br>"
-                f"<a href='https://maps.google.com/?q={r['lat']},{r['lon']}' target='_blank'>Map</a>"
+                f"<a href='https://maps.google.com/?q={r['lat']},{r['lon']}' "
+                f"target='_blank'>Map</a>"
             )
         ).add_to(m)
 
     st_folium(m, width=700, height=500)
 
-elif st.session_state["page"] == "Companies":
+elif page == "Companies":
     st.title("Companies")
     df = pd.read_sql("SELECT * FROM clients", conn)
     if df.empty:
-        st.info("No companies yet. Save some from Map!")
+        st.info("No companies yet. Use Map to add some.")
     else:
         sel = st.selectbox("Select company", df["name"].tolist())
         row = df[df["name"] == sel].iloc[0]
+
         st.subheader(sel)
         st.markdown(row["summary"])
-        st.write(f"**Sector tags:** {', '.join(json.loads(row['sector_tags']))}")
+        tags = json.loads(row["sector_tags"])
+        st.write(f"**Sector tags:** {', '.join(tags)}")
         st.write(f"**Status:** {row['status']}")
         st.write(f"**Location:** {row['lat']}, {row['lon']}")
 
-        # Contacts
+        # Contacts section
         contacts = pd.read_sql(
-            "SELECT * FROM contacts WHERE company=?", conn, params=(sel,)
+            "SELECT * FROM contacts WHERE company=?", 
+            conn, params=(sel,)
         )
         if not contacts.empty:
             st.markdown("**Key contacts:**")
             for _, c in contacts.iterrows():
-                st.write(f"- {c['name']}, {c['title']}, {c['email']}, {c['phone']}")
+                st.write(
+                    f"- {c['name']} ({c['title']}), "
+                    f"{c['email']}, {c['phone']}"
+                )
 
         if st.button("Export profile PDF"):
-            pdf_bytes = export_pdf(row, row["summary"], contacts.to_dict("records"))
-            st.download_button("Download PDF", data=pdf_bytes, file_name=f"{sel}.pdf")
+            pdf_data = export_pdf(
+                {
+                    "company": sel,
+                    "headline": "",
+                    "url": ""
+                },
+                row["summary"],
+                contacts.to_dict("records")
+            )
+            st.download_button(
+                "Download PDF", pdf_data, file_name=f"{sel}.pdf"
+            )
 
-elif st.session_state["page"] == "Pipeline":
+elif page == "Pipeline":
     st.title("Pipeline")
-    # Kanban / Trello-style could go here
-    st.info("No leads to show yet.")
+    st.info("No leads in pipeline yet.")
 
-elif st.session_state["page"] == "Permits":
+elif page == "Permits":
     st.title("Permits")
     permits = fetch_permits()
     if not permits:
-        st.info("No permits.csv found or no permits to display.")
+        st.info("No permits.csv found or no relevant permits.")
     else:
         for p in permits:
             st.markdown(f"**{p['company']}** — {p['type']} — {p['date']}")
@@ -182,4 +193,5 @@ elif st.session_state["page"] == "Permits":
             st.write(f"[Details]({p['details_url']})")
 
 else:
-    st.error("Unknown page selected!")
+    st.error("Unknown page!")
+
